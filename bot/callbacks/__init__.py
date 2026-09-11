@@ -141,7 +141,9 @@ async def callback_format(
         assert result.job is not None
         await message.edit_text(
             "⏳ <b>Queued</b>\n\nWaiting for safe resource admission.",
-            reply_markup=build_progress_keyboard(result.job.job_id),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text="❌ Cancel my delivery", callback_data=f"cancel_sub:{result.subscriber_id}"
+            )]]),
         )
         await callback.answer("Download queued")
 
@@ -172,13 +174,20 @@ async def callback_cancel_job(
     if len(parts) != 2 or not await _authorized(callback, db):
         return
     job = await db.get_job(parts[1])
-    if not job or job.user_id != callback.from_user.id:
+    if not job:
         await callback.answer("This job is unavailable.", show_alert=True)
         return
     if job.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
         await callback.answer("This job is already finished.", show_alert=True)
         return
-    await scheduler.cancel_running_job(job.job_id, callback.from_user.id)
+    cancelled_job_id = await db.cancel_waiting_subscriber_for_job(
+        job.job_id, callback.from_user.id
+    )
+    if not cancelled_job_id:
+        await callback.answer("This delivery is no longer waiting.", show_alert=True)
+        return
+    if await db.count_waiting_subscribers(job.job_id) == 0:
+        await scheduler.cancel_running_job(job.job_id)
     if callback.message:
         await cast(Any, callback.message).edit_text("⏹️ <b>Cancelled</b>")
     await callback.answer("Cancelled")

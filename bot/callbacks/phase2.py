@@ -32,7 +32,7 @@ from ui.builders import (
     build_item_selection_keyboard, build_media_info_details, build_preferred_keyboard,
     build_preferred_media_text, build_resource_keyboard, build_rule_choices,
     build_rule_editor, build_settings_keyboard, build_settings_text, build_users_keyboard,
-    build_user_details,
+    build_user_details, format_button_label,
 )
 
 router = Router(name="phase2-callbacks")
@@ -64,11 +64,14 @@ async def _owned(callback: CallbackQuery, db: Database, session_id: str) -> Medi
     return session
 
 
-async def _preferred(session: MediaSession, db: Database):
+async def _preferred(session: MediaSession, db: Database, page: int = 0):
     preferences = await db.get_user_settings(session.user_id)
     rules = await db.ensure_default_favorite_rules(session.user_id)
     result = FavoriteMatcher.match(session.formats, rules, preferences.matching_strategy)
-    return build_preferred_media_text(session, result), build_preferred_keyboard(session, result)
+    return (
+        build_preferred_media_text(session, result, page),
+        build_preferred_keyboard(session, result, page),
+    )
 
 
 async def _render_submission(callback: CallbackQuery, result: SelectionResult) -> None:
@@ -86,10 +89,11 @@ async def _render_submission(callback: CallbackQuery, result: SelectionResult) -
         )
     else:
         assert result.job
-        from ui.builders import build_progress_keyboard
         await message.edit_text(
             "⏳ <b>Queued</b>\n\nWaiting for safe resource admission.",
-            reply_markup=build_progress_keyboard(result.job.job_id),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                text="❌ Cancel my delivery", callback_data=f"cancel_sub:{result.subscriber_id}"
+            )]]),
         )
 
 
@@ -118,9 +122,11 @@ async def _submit(
 
 @router.callback_query(F.data.startswith("preferred:"))
 async def preferred(callback: CallbackQuery, db: Database) -> None:
-    session = await _owned(callback, db, (callback.data or "").split(":", 1)[-1])
+    parts = (callback.data or "").split(":")
+    session = await _owned(callback, db, parts[1]) if len(parts) in {2, 3} else None
     if session and callback.message:
-        text, markup = await _preferred(session, db)
+        page = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else 0
+        text, markup = await _preferred(session, db, page)
         await cast(Any, callback.message).edit_text(text, reply_markup=markup)
         await callback.answer()
 
@@ -137,13 +143,21 @@ async def details(callback: CallbackQuery, db: Database) -> None:
     if not fmt or not fmt.is_video:
         await callback.answer("That exact format is unavailable.", show_alert=True)
         return
-    audio = select_default_audio(session.formats, fmt) if fmt.requires_separate_audio else None
     preferences = await db.get_user_settings(callback.from_user.id)
+    manual_audio_required = fmt.requires_separate_audio and not preferences.automatic_audio
+    audio = (
+        select_default_audio(session.formats, fmt)
+        if fmt.requires_separate_audio and preferences.automatic_audio else None
+    )
     if callback.message:
         await cast(Any, callback.message).edit_text(
-            build_format_details_text(fmt, audio, preferences.detail_style.value),
+            build_format_details_text(
+                fmt, audio, preferences.detail_style.value,
+                manual_audio_required=manual_audio_required,
+            ),
             reply_markup=build_format_details_keyboard(
-                session, fmt, back="all" if parts[0] == "adetail" else "preferred"
+                session, fmt, back="all" if parts[0] == "adetail" else "preferred",
+                manual_audio_required=manual_audio_required,
             ),
         )
     await callback.answer()
@@ -387,12 +401,19 @@ async def asset_download(
     await _submit(callback, db, scheduler, telegram_service, settings, session, fmt, media_kind="asset")
 
 
-@router.callback_query(F.data == "settings")
+@router.callback_query((F.data == "settings") | F.data.startswith("settings:"))
 async def settings_panel(callback: CallbackQuery, db: Database) -> None:
     if not await _authorized(callback, db):
         return
+    parts = (callback.data or "").split(":", 1)
+    media_session_id = parts[1] if len(parts) == 2 else None
+    if media_session_id and not await _owned(callback, db, media_session_id):
+        return
     settings = await db.get_user_settings(callback.from_user.id)
-    await cast(Any, callback.message).edit_text(build_settings_text(settings), reply_markup=build_settings_keyboard(settings))
+    await cast(Any, callback.message).edit_text(
+        build_settings_text(settings),
+        reply_markup=build_settings_keyboard(settings, media_session_id),
+    )
     await callback.answer()
 
 
@@ -401,7 +422,10 @@ async def settings_update(callback: CallbackQuery, db: Database) -> None:
     if not await _authorized(callback, db):
         return
     parts = (callback.data or "").split(":")
-    if len(parts) != 3:
+    if len(parts) not in {3, 4}:
+        return
+    media_session_id = parts[3] if len(parts) == 4 else None
+    if media_session_id and not await _owned(callback, db, media_session_id):
         return
     current = await db.get_user_settings(callback.from_user.id)
     update: dict[str, Any] = {}
@@ -416,7 +440,10 @@ async def settings_update(callback: CallbackQuery, db: Database) -> None:
     if update:
         current = current.model_copy(update=update)
         await db.save_user_settings(current)
-    await cast(Any, callback.message).edit_text(build_settings_text(current), reply_markup=build_settings_keyboard(current))
+    await cast(Any, callback.message).edit_text(
+        build_settings_text(current),
+        reply_markup=build_settings_keyboard(current, media_session_id),
+    )
     await callback.answer("Saved")
 
 
@@ -513,9 +540,14 @@ async def favorite_operation(callback: CallbackQuery, db: Database) -> None:
 
 
 @router.callback_query(F.data.startswith("cancel_sub:"))
-async def cancel_subscription(callback: CallbackQuery, db: Database) -> None:
+async def cancel_subscription(
+    callback: CallbackQuery, db: Database, scheduler: JobScheduler
+) -> None:
     subscriber_id = (callback.data or "").split(":", 1)[-1]
-    if await db.cancel_subscriber(subscriber_id, callback.from_user.id):
+    job_id = await db.cancel_subscriber(subscriber_id, callback.from_user.id)
+    if job_id:
+        if await db.count_waiting_subscribers(job_id) == 0:
+            await scheduler.cancel_running_job(job_id)
         await cast(Any, callback.message).edit_text("⏹ <b>Your delivery was cancelled</b>")
         await callback.answer("Cancelled")
     else:
@@ -536,11 +568,15 @@ async def _child_session(
             filesize = None
         return _asset_session(parent, Asset(), user_id)[0]
     if item.formats:
+        uses_parent = not item.webpage_url and bool(item.parent_collection_url)
         return MediaSession.with_ttl(
             ttl_seconds=max(60, int(parent.expires_at - parent.created_at)),
             user_id=user_id, url=item.source_url, canonical_url=item.source_url,
             extractor=parent.extractor, title=item.title, media_id=item.extractor_id,
             thumbnail_url=item.thumbnail_url, formats=item.formats,
+            parent_collection_url=item.parent_collection_url if uses_parent else None,
+            collection_entry_index=item.collection_entry_index if uses_parent else None,
+            collection_entry_id=item.collection_entry_id if uses_parent else None,
         )
     lease, _ = await governor.acquire_stage("extraction")
     if not lease:
@@ -563,6 +599,186 @@ async def collection(callback: CallbackQuery, db: Database) -> None:
             reply_markup=build_collection_keyboard(session, int(parts[2]) if len(parts) == 3 else 0),
         )
         await callback.answer()
+
+
+@router.callback_query(F.data.startswith("allmedia:"))
+async def prepare_download_all(
+    callback: CallbackQuery, db: Database, extractor_registry: ExtractorRegistry,
+    governor: ResourceGovernor,
+) -> None:
+    session = await _owned(callback, db, (callback.data or "").split(":", 1)[-1])
+    if not session or not callback.message:
+        return
+    preferences = await db.get_user_settings(callback.from_user.id)
+    rules = await db.ensure_default_favorite_rules(callback.from_user.id)
+    choices: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    lines = [
+        "📦 <b>Download All Media</b>", "",
+        "Configured Favorite rules determine each exact video stream.", "",
+    ]
+    for index, item in enumerate(session.items, 1):
+        child = await _child_session(
+            session, item, callback.from_user.id, extractor_registry, governor
+        )
+        if not child:
+            lines.append(f"{index}. ⏳ Temporarily unavailable")
+            continue
+        await db.save_media_session(child)
+        if item.kind == "image" and child.formats:
+            fmt = child.formats[0]
+            choices.append({
+                "session_id": child.session_id, "primary_key": fmt.internal_key,
+                "audio_key": None, "media_kind": "asset", "title": item.title,
+            })
+            lines.append(f"{index}. 🖼 Original image")
+            continue
+        if child.items:
+            missing.append({
+                "session_id": child.session_id, "title": item.title,
+                "reason": "collection",
+            })
+            lines.append(f"{index}. 📚 Item selection required")
+            continue
+        matches = FavoriteMatcher.match(
+            child.formats, rules, preferences.matching_strategy
+        )
+        primary = matches.formats[0] if matches.formats else None
+        if not primary:
+            missing.append({
+                "session_id": child.session_id, "title": item.title,
+                "reason": "format",
+            })
+            lines.append(f"{index}. 🎞 Format selection required")
+            continue
+        audio = None
+        if primary.requires_separate_audio:
+            if preferences.automatic_audio:
+                audio = select_default_audio(child.formats, primary)
+            if audio is None:
+                missing.append({
+                    "session_id": child.session_id, "title": item.title,
+                    "reason": "audio", "primary_key": primary.internal_key,
+                })
+                lines.append(f"{index}. 🎞 Audio selection required")
+                continue
+        choices.append({
+            "session_id": child.session_id, "primary_key": primary.internal_key,
+            "audio_key": audio.internal_key if audio else None,
+            "media_kind": "video", "title": item.title,
+        })
+        lines.append(f"{index}. 🎞 {escape(format_button_label(primary))}")
+    lines.extend(("", f"Ready to queue: {len(choices)}", f"Needs selection: {len(missing)}"))
+    await db.save_ui_draft(callback.from_user.id, {
+        "kind": "download_all", "session_id": session.session_id,
+        "choices": choices, "missing": missing,
+    })
+    buttons: list[list[InlineKeyboardButton]] = []
+    if choices:
+        buttons.append([InlineKeyboardButton(
+            text="▶️ Queue available items", callback_data=f"allqueue:{session.session_id}"
+        )])
+    if missing:
+        buttons.append([InlineKeyboardButton(
+            text="🎞 Choose missing formats", callback_data=f"allmissing:{session.session_id}"
+        )])
+    buttons.append([InlineKeyboardButton(
+        text="❌ Cancel", callback_data=f"allcancel:{session.session_id}"
+    )])
+    await cast(Any, callback.message).edit_text(
+        "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer("Exact selections prepared")
+
+
+@router.callback_query(F.data.startswith("allmissing:"))
+async def choose_missing_formats(callback: CallbackQuery, db: Database) -> None:
+    session_id = (callback.data or "").split(":", 1)[-1]
+    if not await _owned(callback, db, session_id) or not callback.message:
+        return
+    draft = await db.get_ui_draft(callback.from_user.id)
+    if not draft or draft.get("kind") != "download_all" or draft.get("session_id") != session_id:
+        await callback.answer("This confirmation has expired.", show_alert=True)
+        return
+    for missing in draft.get("missing") or []:
+        child = await db.get_media_session(str(missing.get("session_id") or ""))
+        if not child or child.user_id != callback.from_user.id or child.is_expired():
+            continue
+        if child.items:
+            await cast(Any, callback.message).answer(
+                build_collection_text(child), reply_markup=build_collection_keyboard(child)
+            )
+        elif missing.get("reason") == "audio" and missing.get("primary_key"):
+            await cast(Any, callback.message).answer(
+                f"🎵 <b>{escape(str(missing.get('title') or child.title))}</b>\n\nChoose an exact audio stream.",
+                reply_markup=build_audio_keyboard(child, str(missing["primary_key"])),
+            )
+        else:
+            text, markup = await _preferred(child, db)
+            await cast(Any, callback.message).answer(text, reply_markup=markup)
+    await callback.answer("Selection panels opened")
+
+
+@router.callback_query(F.data.startswith("allqueue:"))
+async def queue_download_all(
+    callback: CallbackQuery, db: Database, scheduler: JobScheduler,
+    telegram_service: TelegramService, settings: Settings,
+) -> None:
+    session_id = (callback.data or "").split(":", 1)[-1]
+    if not await _owned(callback, db, session_id) or not callback.message:
+        return
+    draft = await db.get_ui_draft(callback.from_user.id)
+    if not draft or draft.get("kind") != "download_all" or draft.get("session_id") != session_id:
+        await callback.answer("This confirmation has expired.", show_alert=True)
+        return
+    queued = 0
+    failed = 0
+    message = cast(Any, callback.message)
+    for choice in draft.get("choices") or []:
+        child = await db.get_media_session(str(choice.get("session_id") or ""))
+        primary = child.get_format_by_key(str(choice.get("primary_key") or "")) if child else None
+        audio = child.get_format_by_key(str(choice["audio_key"])) if child and choice.get("audio_key") else None
+        if not child or child.user_id != callback.from_user.id or child.is_expired() or not primary:
+            failed += 1
+            continue
+        status_message = await message.answer(
+            f"⏳ <b>{escape(str(choice.get('title') or child.title))}</b>\n\nPreparing exact selection."
+        )
+        try:
+            result = await submit_exact_selection(
+                db=db, scheduler=scheduler, telegram_service=telegram_service,
+                app_settings=settings, session=child, primary=primary, audio=audio,
+                user_id=callback.from_user.id, chat_id=status_message.chat.id,
+                message_id=status_message.message_id,
+                media_kind=str(choice.get("media_kind") or "video"),
+            )
+            if result.disposition == "cache":
+                await status_message.edit_text("✅ <b>Delivered from private cache</b>")
+            else:
+                label = "Joined identical active download" if result.disposition == "coalesced" else "Queued"
+                await status_message.edit_text(
+                    f"⏳ <b>{label}</b>",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                        text="❌ Cancel my delivery", callback_data=f"cancel_sub:{result.subscriber_id}"
+                    )]]),
+                )
+            queued += 1
+        except (QueueLimitError, ValueError):
+            failed += 1
+            await status_message.edit_text("❌ This exact item could not be queued.")
+    await db.delete_ui_draft(callback.from_user.id)
+    await message.edit_text(
+        f"📦 <b>Download All Media</b>\n\nQueued/delivered: {queued}\nNot queued: {failed}"
+    )
+    await callback.answer("Available exact selections processed")
+
+
+@router.callback_query(F.data.startswith("allcancel:"))
+async def cancel_download_all(callback: CallbackQuery, db: Database) -> None:
+    await db.delete_ui_draft(callback.from_user.id)
+    if callback.message:
+        await cast(Any, callback.message).edit_text("Download All Media cancelled.")
+    await callback.answer("Cancelled")
 
 
 @router.callback_query(F.data.startswith("item:"))
@@ -601,12 +817,17 @@ async def collection_item(
 
 @router.callback_query(F.data.startswith("iselect:"))
 async def select_items(callback: CallbackQuery, db: Database) -> None:
-    session = await _owned(callback, db, (callback.data or "").split(":", 1)[-1])
+    parts = (callback.data or "").split(":")
+    session = await _owned(callback, db, parts[1]) if len(parts) in {2, 3} else None
     if session:
-        draft = {"kind": "items", "session_id": session.session_id, "selected": []}
-        await db.save_ui_draft(callback.from_user.id, draft)
+        page = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else 0
+        draft = await db.get_ui_draft(callback.from_user.id)
+        if not draft or draft.get("kind") != "items" or draft.get("session_id") != session.session_id:
+            draft = {"kind": "items", "session_id": session.session_id, "selected": []}
+            await db.save_ui_draft(callback.from_user.id, draft)
         await cast(Any, callback.message).edit_text(
-            "☑ <b>Select media items</b>", reply_markup=build_item_selection_keyboard(session, [])
+            "☑ <b>Select media items</b>",
+            reply_markup=build_item_selection_keyboard(session, list(draft.get("selected") or []), page),
         )
         await callback.answer()
 
@@ -629,7 +850,7 @@ async def select_first(callback: CallbackQuery, db: Database) -> None:
 @router.callback_query(F.data.startswith("itoggle:"))
 async def item_toggle(callback: CallbackQuery, db: Database) -> None:
     parts = (callback.data or "").split(":")
-    session = await _owned(callback, db, parts[1]) if len(parts) == 3 else None
+    session = await _owned(callback, db, parts[1]) if len(parts) == 4 else None
     draft = await db.get_ui_draft(callback.from_user.id)
     if not session or not draft or draft.get("kind") != "items" or draft.get("session_id") != parts[1]:
         return
@@ -637,7 +858,10 @@ async def item_toggle(callback: CallbackQuery, db: Database) -> None:
     selected = [item for item in selected if item != parts[2]] if parts[2] in selected else selected + [parts[2]]
     draft["selected"] = selected
     await db.save_ui_draft(callback.from_user.id, draft)
-    await cast(Any, callback.message).edit_reply_markup(reply_markup=build_item_selection_keyboard(session, selected))
+    page = int(parts[3]) if parts[3].isdigit() else 0
+    await cast(Any, callback.message).edit_reply_markup(
+        reply_markup=build_item_selection_keyboard(session, selected, page)
+    )
     await callback.answer()
 
 
@@ -665,7 +889,11 @@ async def process_selected(
                 text="⬇️ Download original", callback_data=f"assetfmt:{child.session_id}:{child.formats[0].internal_key}"
             )]])
             await cast(Any, callback.message).answer(f"🖼 <b>{escape(item.title)}</b>", reply_markup=markup)
-        elif not child.items:
+        elif child.items:
+            await cast(Any, callback.message).answer(
+                build_collection_text(child), reply_markup=build_collection_keyboard(child)
+            )
+        else:
             text, markup = await _preferred(child, db)
             await cast(Any, callback.message).answer(text, reply_markup=markup)
     await db.delete_ui_draft(callback.from_user.id)

@@ -12,6 +12,7 @@ _YTDLP_PERCENT_RE = re.compile(r"\[download\]\s+(\d+\.\d+)%")
 _YTDLP_SIZE_RE = re.compile(r"\[download\]\s+of\s+(\d+\.\d+)(KiB|MiB|GiB|B)")
 _YTDLP_SPEED_RE = re.compile(r"at\s+(\d+\.\d+)(KiB|MiB|GiB|B)/s")
 _YTDLP_ETA_RE = re.compile(r"ETA\s+(\d+:\d+|\d+:\d+:\d+|\d+s)")
+_STRUCTURED_PREFIX = "__AVDB_PROGRESS__|"
 
 
 class ProgressTracker:
@@ -30,6 +31,9 @@ class ProgressTracker:
 
     def parse_line(self, line: str, expected_size: Optional[int] = None) -> None:
         """Parse a single output line from yt-dlp to extract download progress."""
+        if line.startswith(_STRUCTURED_PREFIX):
+            self._parse_structured(line, expected_size)
+            return
         if not line or not line.startswith("[download]"):
             return
 
@@ -77,6 +81,36 @@ class ProgressTracker:
         if total_bytes:
             downloaded = int(total_bytes * (pct / 100.0))
 
+        self._emit(pct, downloaded, total_bytes, speed, eta)
+
+    def _parse_structured(self, line: str, expected_size: Optional[int]) -> None:
+        fields = line.strip().split("|")
+        if len(fields) != 7 or fields[0] != "__AVDB_PROGRESS__":
+            return
+        try:
+            downloaded = self._number(fields[2], int) or 0
+            total = self._number(fields[3], int) or self._number(fields[4], int) or expected_size
+            speed = self._number(fields[5], float) or 0.0
+            eta = self._number(fields[6], int)
+            percent_text = fields[1].strip().replace("%", "")
+            pct = float(percent_text) if percent_text not in {"", "NA", "N/A", "None"} else (
+                downloaded * 100.0 / total if total else 0.0
+            )
+        except (TypeError, ValueError):
+            return
+        self._emit(pct, downloaded, total, speed, eta)
+
+    @staticmethod
+    def _number(value: str, converter):
+        value = value.strip()
+        if value in {"", "NA", "N/A", "None", "null"}:
+            return None
+        return converter(float(value))
+
+    def _emit(
+        self, pct: float, downloaded: int, total_bytes: Optional[int],
+        speed: float, eta: Optional[int],
+    ) -> None:
         # Check throttling
         now = time.time()
         # Always allow first (0%), final (100%), or large percentage jumps, or throttle time elapsed

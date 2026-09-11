@@ -361,6 +361,10 @@ class JobScheduler:
             "download-video",
             direct_source=job.extractor == "direct",
             raw_http=job.media_kind == "asset",
+            **(
+                {"playlist_index": job.collection_entry_index}
+                if job.collection_entry_index is not None else {}
+            ),
         )
         if not audio:
             return video_path
@@ -378,6 +382,10 @@ class JobScheduler:
                 video_progress,
                 pid_update,
                 "download-audio",
+                **(
+                    {"playlist_index": job.collection_entry_index}
+                    if job.collection_entry_index is not None else {}
+                ),
             )
         return video_path
 
@@ -412,8 +420,29 @@ class JobScheduler:
                 refreshed: MediaSession = await extractor.extract(
                     job.source_url, job.user_id, operation_id=job.job_id
                 )
-            current_video = refreshed.get_format_by_id(job.video_format_id)
-            current_audio = refreshed.get_format_by_id(job.audio_format_id) if job.audio_format_id else None
+            inventory = refreshed.formats
+            if job.collection_entry_index is not None:
+                selected_item = next(
+                    (
+                        item for item in refreshed.items
+                        if item.collection_entry_index == job.collection_entry_index
+                        and (
+                            job.collection_entry_id is None
+                            or item.collection_entry_id == job.collection_entry_id
+                        )
+                    ),
+                    None,
+                )
+                if selected_item is None:
+                    raise ExactFormatUnavailableError()
+                inventory = selected_item.formats
+            current_video = next(
+                (item for item in inventory if item.format_id == job.video_format_id), None
+            )
+            current_audio = (
+                next((item for item in inventory if item.format_id == job.audio_format_id), None)
+                if job.audio_format_id else None
+            )
             if not current_video or (job.audio_format_id and not current_audio):
                 raise ExactFormatUnavailableError()
             self._assert_material_identity(video, current_video)

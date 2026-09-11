@@ -15,7 +15,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.callbacks import router as callbacks_router
 from bot.callbacks.phase2 import router as phase2_callbacks_router
@@ -114,30 +114,46 @@ class BotApplication:
 
         async def upload(path: Path, job: DownloadJob) -> None:
             assert self.telegram_service is not None
-            await self.telegram_service.send_media(
-                job, path, "Downloaded without re-encoding where streams required combining."
-            )
-            if job.output_identity and job.telegram_file_id:
-                await self.db.save_cached_file(
-                    job.output_identity, job.telegram_file_id, job.send_mode,
-                    path.suffix.lower().lstrip(".") or "bin",
-                )
-                for subscriber in await self.db.list_job_subscribers(job.job_id):
-                    try:
+            telegram_file_id: Optional[str] = None
+            for subscriber in await self.db.list_job_subscribers(job.job_id):
+                if not await self.db.subscriber_is_waiting(subscriber["subscriber_id"]):
+                    continue
+                try:
+                    if telegram_file_id:
                         await self.telegram_service.send_cached(
-                            subscriber["chat_id"], job.telegram_file_id,
+                            subscriber["chat_id"], telegram_file_id,
                             subscriber["send_mode"],
                             "Exact output delivered from a shared private download.",
                         )
-                        await self.db.mark_subscriber(subscriber["subscriber_id"], "delivered")
-                        if subscriber["message_id"]:
-                            await self.bot.edit_message_text(
-                                chat_id=subscriber["chat_id"], message_id=subscriber["message_id"],
-                                text="✅ <b>Download Complete</b>\n\nOriginal output delivered without re-encoding.",
+                    else:
+                        delivery_job = job.model_copy(update={
+                            "chat_id": subscriber["chat_id"],
+                            "message_id": subscriber["message_id"],
+                            "send_mode": subscriber["send_mode"],
+                            "telegram_file_id": None,
+                        })
+                        await self.telegram_service.send_media(
+                            delivery_job, path,
+                            "Downloaded without re-encoding where streams required combining.",
+                        )
+                        if not delivery_job.telegram_file_id:
+                            raise RuntimeError("Telegram did not return a reusable file identifier")
+                        telegram_file_id = delivery_job.telegram_file_id
+                        job.telegram_file_id = telegram_file_id
+                        if job.output_identity:
+                            await self.db.save_cached_file(
+                                job.output_identity, telegram_file_id, subscriber["send_mode"],
+                                path.suffix.lower().lstrip(".") or "bin",
                             )
-                    except Exception:
-                        logger.warning("Coalesced subscriber delivery failed", exc_info=True)
-                        await self.db.mark_subscriber(subscriber["subscriber_id"], "failed")
+                    await self.db.mark_subscriber(subscriber["subscriber_id"], "delivered")
+                    if subscriber["message_id"]:
+                        await self.bot.edit_message_text(
+                            chat_id=subscriber["chat_id"], message_id=subscriber["message_id"],
+                            text="✅ <b>Download Complete</b>\n\nOriginal output delivered without re-encoding.",
+                        )
+                except Exception:
+                    logger.warning("Independent recipient delivery failed", exc_info=True)
+                    await self.db.mark_subscriber(subscriber["subscriber_id"], "failed")
 
         self.scheduler = JobScheduler(
             self.db,
@@ -191,16 +207,24 @@ class BotApplication:
         if not terminal and now - self._progress_last.get(job.job_id, 0.0) < 2.0:
             return
         self._progress_last[job.job_id] = now
-        if job.message_id:
-            try:
-                await self.bot.edit_message_text(
-                    chat_id=job.chat_id,
-                    message_id=job.message_id,
-                    text=build_progress_text(job),
-                    reply_markup=None if terminal else build_progress_keyboard(job.job_id),
-                )
-            except Exception:
-                logger.debug("Progress edit was rejected or unchanged", exc_info=True)
+        if self.db:
+            for recipient in await self.db.list_job_subscribers(job.job_id):
+                if not recipient["message_id"]:
+                    continue
+                try:
+                    await self.bot.edit_message_text(
+                        chat_id=recipient["chat_id"],
+                        message_id=recipient["message_id"],
+                        text=build_progress_text(job),
+                        reply_markup=None if terminal else InlineKeyboardMarkup(
+                            inline_keyboard=[[InlineKeyboardButton(
+                                text="❌ Cancel my delivery",
+                                callback_data=f"cancel_sub:{recipient['subscriber_id']}",
+                            )]]
+                        ),
+                    )
+                except Exception:
+                    logger.debug("Recipient progress edit was rejected or unchanged", exc_info=True)
         if terminal and self.db and job.status in {JobStatus.FAILED, JobStatus.CANCELLED}:
             for subscriber in await self.db.list_job_subscribers(job.job_id):
                 status = "cancelled" if job.status == JobStatus.CANCELLED else "failed"

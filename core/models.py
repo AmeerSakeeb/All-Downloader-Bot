@@ -89,6 +89,11 @@ class MediaItem(BaseModel):
     item_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:10])
     kind: str = "video"
     source_url: str
+    webpage_url: Optional[str] = None
+    direct_source_url: Optional[str] = None
+    parent_collection_url: Optional[str] = None
+    collection_entry_index: Optional[int] = None
+    collection_entry_id: Optional[str] = None
     title: str = "Media item"
     extractor_id: Optional[str] = None
     max_height: Optional[int] = None
@@ -196,6 +201,9 @@ class MediaSession(BaseModel):
     thumbnails: List[MediaAsset] = Field(default_factory=list)
     subtitles: List[MediaAsset] = Field(default_factory=list)
     items: List[MediaItem] = Field(default_factory=list)
+    parent_collection_url: Optional[str] = None
+    collection_entry_index: Optional[int] = None
+    collection_entry_id: Optional[str] = None
 
     # Complete format inventory
     formats: List[MediaFormat] = Field(default_factory=list)
@@ -280,3 +288,5 @@ class DownloadJob(BaseModel):
     claimed_at: Optional[float] = None
     media_kind: str = "video"
     output_identity: Optional[str] = None
+    collection_entry_index: Optional[int] = None
+    collection_entry_id: Optional[str] = None

@@ -92,7 +92,7 @@ class YtDlpExtractor(Extractor):
         self._validate_extracted_urls(metadata)
         raw_formats = metadata.get("formats") or ([metadata] if metadata.get("url") else [])
         formats = normalize_format_inventory(raw_formats)
-        items = self._media_items(metadata)
+        items = self._media_items(metadata, parent_url=url)
         if not formats and not items:
             raise ExtractionError("No downloadable formats were found")
         thumbnails = self._thumbnail_assets(metadata.get("thumbnails") or [])
@@ -155,24 +155,35 @@ class YtDlpExtractor(Extractor):
         return assets
 
     @staticmethod
-    def _media_items(metadata: dict[str, Any]) -> list[MediaItem]:
+    def _media_items(metadata: dict[str, Any], *, parent_url: str) -> list[MediaItem]:
         items: list[MediaItem] = []
-        for entry in metadata.get("entries") or []:
+        for position, entry in enumerate(metadata.get("entries") or [], 1):
             if not isinstance(entry, dict):
                 continue
             raw_formats = entry.get("formats") or []
             formats = normalize_format_inventory(raw_formats)
-            source = entry.get("webpage_url") or entry.get("original_url") or entry.get("url")
-            if not isinstance(source, str) or not source.startswith(("http://", "https://")):
-                continue
+            webpage_url = entry.get("webpage_url")
+            direct_source_url = entry.get("url") or entry.get("original_url")
             ext = str(entry.get("ext") or "").lower()
             kind = "image" if ext in {"jpg", "jpeg", "png", "webp", "gif"} else "video"
+            source = webpage_url or (direct_source_url if kind == "image" else parent_url)
+            if not isinstance(source, str) or not source.startswith(("http://", "https://")):
+                continue
             heights = [fmt.height for fmt in formats if fmt.is_video and fmt.height]
+            entry_id = str(entry.get("id")) if entry.get("id") is not None else None
+            entry_index = entry.get("playlist_index")
+            if not isinstance(entry_index, int) or entry_index < 1:
+                entry_index = position
             items.append(MediaItem(
                 kind=kind,
                 source_url=source,
+                webpage_url=webpage_url if isinstance(webpage_url, str) else None,
+                direct_source_url=direct_source_url if isinstance(direct_source_url, str) else None,
+                parent_collection_url=parent_url,
+                collection_entry_index=entry_index,
+                collection_entry_id=entry_id,
                 title=entry.get("title") or f"Item {len(items) + 1}",
-                extractor_id=str(entry.get("id")) if entry.get("id") is not None else None,
+                extractor_id=entry_id,
                 max_height=max(heights) if heights else None,
                 formats=formats,
                 thumbnail_url=entry.get("thumbnail"),

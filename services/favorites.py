@@ -27,7 +27,6 @@ class FavoriteMatcher:
         formats: list[MediaFormat],
         rules: list[FavoriteFormatRule],
         strategy: MatchingStrategy = MatchingStrategy.BEST_QUALITY,
-        limit: int = 8,
     ) -> FavoriteMatchResult:
         videos = [fmt for fmt in formats if fmt.is_video]
         enabled = sorted((rule for rule in rules if rule.enabled), key=lambda r: (r.priority, r.rule_id))
@@ -52,7 +51,7 @@ class FavoriteMatcher:
                     continue
                 rule_matched = True
                 fmt = sorted(candidates, key=lambda item: cls._rank(item, strategy))[0]
-                if len(selected) < limit and all(
+                if all(
                     existing.internal_key != fmt.internal_key for existing in selected
                 ):
                     selected.append(fmt)

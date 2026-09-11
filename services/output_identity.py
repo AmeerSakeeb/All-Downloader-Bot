@@ -25,6 +25,8 @@ def build_output_identity(
         "expected_container": expected_container,
         "send_mode": send_mode,
         "media_kind": media_kind,
+        "collection_entry_index": session.collection_entry_index,
+        "collection_entry_id": session.collection_entry_id,
     }
     return hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")

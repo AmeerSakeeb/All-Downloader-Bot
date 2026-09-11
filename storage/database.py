@@ -15,7 +15,7 @@ from core.models import (
     MediaFormat, MediaSession, UserSettings,
 )
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 6
 ACTIVE_STATUSES = tuple(
     status.value
     for status in (
@@ -88,6 +88,8 @@ class Database:
             2: self._migration_v2,
             3: self._migration_v3,
             4: self._migration_v4,
+            5: self._migration_v5,
+            6: self._migration_v6,
         }
         for version in range(current + 1, CURRENT_SCHEMA_VERSION + 1):
             await db.execute("BEGIN IMMEDIATE")
@@ -214,6 +216,7 @@ class Database:
                 created_at REAL NOT NULL,expires_at REAL NOT NULL
             )"""
         )
+
         session_columns = {
             row["name"]
             for row in await (await self.connection.execute("PRAGMA table_info(media_sessions)")).fetchall()
@@ -296,6 +299,89 @@ class Database:
             """
         )
 
+    async def _migration_v5(self) -> None:
+        job_columns = {
+            row["name"]
+            for row in await (
+                await self.connection.execute("PRAGMA table_info(download_jobs)")
+            ).fetchall()
+        }
+        for name, sql_type in (
+            ("collection_entry_index", "INTEGER"),
+            ("collection_entry_id", "TEXT"),
+        ):
+            if name not in job_columns:
+                await self.connection.execute(
+                    f"ALTER TABLE download_jobs ADD COLUMN {name} {sql_type}"
+                )
+        # Upgrade active Phase 2 jobs so their creator has the same independent
+        # delivery/cancellation semantics as every later coalesced requester.
+        marks = ",".join("?" for _ in ACTIVE_STATUSES)
+        await self.connection.execute(
+            f"""INSERT OR IGNORE INTO job_subscribers
+                (subscriber_id,job_id,user_id,chat_id,message_id,send_mode,status,created_at)
+                SELECT lower(hex(randomblob(16))),j.job_id,j.user_id,j.chat_id,j.message_id,
+                       j.send_mode,'waiting',j.created_at
+                FROM download_jobs AS j
+                WHERE j.status IN ({marks}) AND NOT EXISTS (
+                    SELECT 1 FROM job_subscribers AS s
+                    WHERE s.job_id=j.job_id AND s.user_id=j.user_id
+                      AND s.chat_id=j.chat_id
+                      AND (s.message_id=j.message_id OR (s.message_id IS NULL AND j.message_id IS NULL))
+                )""",
+            ACTIVE_STATUSES,
+        )
+        await self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subscribers_user_status "
+            "ON job_subscribers(user_id,status,job_id)"
+        )
+
+    async def _migration_v6(self) -> None:
+        # Drafts are intentionally ephemeral; replace the single-user slot with
+        # explicit workflow/session keys instead of attempting to preserve it.
+        await self.connection.execute("DROP TABLE IF EXISTS ui_drafts")
+        await self.connection.execute(
+            """CREATE TABLE ui_drafts (
+                user_id INTEGER NOT NULL,
+                draft_key TEXT NOT NULL,
+                draft_json TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(user_id,draft_key)
+            )"""
+        )
+        # Waiting-recipient uniqueness is partial so a completed/cancelled
+        # historical recipient row never blocks a later explicit request.
+        await self.connection.execute("ALTER TABLE job_subscribers RENAME TO job_subscribers_v5")
+        await self.connection.execute(
+            """CREATE TABLE job_subscribers (
+                subscriber_id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER,
+                send_mode TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'waiting',
+                created_at REAL NOT NULL
+            )"""
+        )
+        await self.connection.execute(
+            """INSERT INTO job_subscribers
+               SELECT subscriber_id,job_id,user_id,chat_id,message_id,send_mode,status,created_at
+               FROM job_subscribers_v5"""
+        )
+        await self.connection.execute("DROP TABLE job_subscribers_v5")
+        await self.connection.execute(
+            "CREATE INDEX idx_subscribers_job ON job_subscribers(job_id,status)"
+        )
+        await self.connection.execute(
+            "CREATE INDEX idx_subscribers_user_status ON job_subscribers(user_id,status,job_id)"
+        )
+        await self.connection.execute(
+            """CREATE UNIQUE INDEX uq_waiting_recipient
+               ON job_subscribers(job_id,user_id,chat_id,COALESCE(message_id,-1))
+               WHERE status='waiting'"""
+        )
+
     async def schema_version(self) -> int:
         row = await (
             await self.connection.execute(
@@ -348,6 +434,7 @@ class Database:
             include={
                 "description", "upload_date", "media_id", "session_kind",
                 "collection_truncated", "thumbnails", "subtitles", "items",
+                "parent_collection_url", "collection_entry_index", "collection_entry_id",
             },
         )
         await self.connection.execute(
@@ -441,6 +528,8 @@ class Database:
             "canonical_url": session.canonical_url,
             "extractor": session.extractor,
             "title": session.title,
+            "collection_entry_index": session.collection_entry_index,
+            "collection_entry_id": session.collection_entry_id,
         }
         job = DownloadJob(
             media_session_id=session.session_id,
@@ -457,6 +546,8 @@ class Database:
             send_mode=send_mode,
             media_kind=media_kind,
             output_identity=output_identity,
+            collection_entry_index=session.collection_entry_index,
+            collection_entry_id=session.collection_entry_id,
         )
         # A separate connection isolates this short transaction from concurrent
         # progress/reservation writes on the application's main connection.
@@ -490,6 +581,15 @@ class Database:
             ):
                 raise ValueError("Media session is stale or not owned by this user")
             await self._insert_job(job, snapshot, connection=db)
+            await db.execute(
+                """INSERT INTO job_subscribers
+                   (subscriber_id,job_id,user_id,chat_id,message_id,send_mode,status,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    uuid.uuid4().hex, job.job_id, session.user_id, chat_id,
+                    message_id, send_mode, "waiting", time.time(),
+                ),
+            )
             await db.commit()
         except BaseException:
             await db.rollback()
@@ -509,8 +609,8 @@ class Database:
                 speed_bytes_sec,eta_seconds,current_stage,process_pid,error_message,
                 error_category,send_mode,output_path,telegram_file_id,snapshot_json,
                 created_at,updated_at,source_url,canonical_url,extractor,claimed_at,
-                media_kind,output_identity)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                media_kind,output_identity,collection_entry_index,collection_entry_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             self._job_values(job, snapshot),
         )
 
@@ -523,6 +623,8 @@ class Database:
             "source_url": job.source_url,
             "canonical_url": job.canonical_url,
             "extractor": job.extractor,
+            "collection_entry_index": job.collection_entry_index,
+            "collection_entry_id": job.collection_entry_id,
         }
         return (
             job.job_id,
@@ -554,6 +656,8 @@ class Database:
             job.claimed_at,
             job.media_kind,
             job.output_identity,
+            job.collection_entry_index,
+            job.collection_entry_id,
         )
 
     async def save_job(self, job: DownloadJob) -> None:
@@ -564,13 +668,16 @@ class Database:
             "source_url": job.source_url,
             "canonical_url": job.canonical_url,
             "extractor": job.extractor,
+            "collection_entry_index": job.collection_entry_index,
+            "collection_entry_id": job.collection_entry_id,
         }
         await self.connection.execute(
             """UPDATE download_jobs SET message_id=?,status=?,progress_pct=?,
                downloaded_bytes=?,total_bytes=?,speed_bytes_sec=?,eta_seconds=?,
                current_stage=?,process_pid=?,error_message=?,error_category=?,send_mode=?,
                output_path=?,telegram_file_id=?,snapshot_json=?,updated_at=?,source_url=?,
-               canonical_url=?,extractor=?,claimed_at=?,media_kind=?,output_identity=?
+               canonical_url=?,extractor=?,claimed_at=?,media_kind=?,output_identity=?,
+               collection_entry_index=?,collection_entry_id=?
                WHERE job_id=? AND (status<>? OR ?=?)""",
             (
                 job.message_id,
@@ -595,6 +702,8 @@ class Database:
                 job.claimed_at,
                 job.media_kind,
                 job.output_identity,
+                job.collection_entry_index,
+                job.collection_entry_id,
                 job.job_id,
                 JobStatus.CANCELLED.value,
                 job.status.value,
@@ -639,12 +748,16 @@ class Database:
         row = await (
             await (connection or self.connection).execute(
                 f"""SELECT COUNT(*) AS active_count FROM (
-                    SELECT job_id AS token FROM download_jobs
-                    WHERE user_id=? AND status IN ({marks})
-                    UNION ALL
-                    SELECT s.subscriber_id AS token FROM job_subscribers AS s
+                    SELECT s.job_id AS token FROM job_subscribers AS s
                     JOIN download_jobs AS j ON j.job_id=s.job_id
                     WHERE s.user_id=? AND s.status='waiting' AND j.status IN ({marks})
+                    UNION
+                    SELECT j.job_id AS token FROM download_jobs AS j
+                    WHERE j.user_id=? AND j.status IN ({marks})
+                      AND NOT EXISTS (
+                          SELECT 1 FROM job_subscribers AS any_recipient
+                          WHERE any_recipient.job_id=j.job_id
+                      )
                 )""",
                 (int(user_id), *ACTIVE_STATUSES, int(user_id), *ACTIVE_STATUSES),
             )
@@ -916,24 +1029,35 @@ class Database:
             await self.save_favorite_rule(rule.model_copy(update={"priority": priority}))
         return True
 
-    async def save_ui_draft(self, user_id: int, draft: dict[str, Any]) -> None:
+    async def save_ui_draft(
+        self, user_id: int, draft_key: str, draft: dict[str, Any]
+    ) -> None:
         await self.connection.execute(
-            """INSERT INTO ui_drafts(user_id,draft_json,updated_at) VALUES(?,?,?)
-               ON CONFLICT(user_id) DO UPDATE SET draft_json=excluded.draft_json,
+            """INSERT INTO ui_drafts(user_id,draft_key,draft_json,updated_at) VALUES(?,?,?,?)
+               ON CONFLICT(user_id,draft_key) DO UPDATE SET draft_json=excluded.draft_json,
                updated_at=excluded.updated_at""",
-            (int(user_id), json.dumps(draft, separators=(",", ":")), time.time()),
+            (
+                int(user_id), draft_key,
+                json.dumps(draft, separators=(",", ":")), time.time(),
+            ),
         )
 
-    async def get_ui_draft(self, user_id: int) -> Optional[dict[str, Any]]:
+    async def get_ui_draft(
+        self, user_id: int, draft_key: str
+    ) -> Optional[dict[str, Any]]:
         row = await (
             await self.connection.execute(
-                "SELECT draft_json FROM ui_drafts WHERE user_id=?", (int(user_id),)
+                "SELECT draft_json FROM ui_drafts WHERE user_id=? AND draft_key=?",
+                (int(user_id), draft_key),
             )
         ).fetchone()
         return json.loads(row["draft_json"]) if row else None
 
-    async def delete_ui_draft(self, user_id: int) -> None:
-        await self.connection.execute("DELETE FROM ui_drafts WHERE user_id=?", (int(user_id),))
+    async def delete_ui_draft(self, user_id: int, draft_key: str) -> None:
+        await self.connection.execute(
+            "DELETE FROM ui_drafts WHERE user_id=? AND draft_key=?",
+            (int(user_id), draft_key),
+        )
 
     async def get_cached_file(self, output_identity: str) -> Optional[dict[str, Any]]:
         row = await (
@@ -978,21 +1102,45 @@ class Database:
         ).fetchone()
         return self._job_from_row(row) if row else None
 
-    async def add_job_subscriber(
+    async def try_add_job_subscriber(
         self,
         job_id: str,
+        output_identity: str,
         user_id: int,
         chat_id: int,
         message_id: Optional[int],
         send_mode: str,
         max_queued_jobs_per_user: int,
-    ) -> str:
+    ) -> Optional[str]:
         db = await aiosqlite.connect(str(self.db_path), isolation_level=None)
         db.row_factory = aiosqlite.Row
         subscriber_id = uuid.uuid4().hex
         try:
             await db.execute("PRAGMA busy_timeout=5000")
             await db.execute("BEGIN IMMEDIATE")
+            marks = ",".join("?" for _ in ACTIVE_STATUSES)
+            job = await (
+                await db.execute(
+                    f"""SELECT job_id FROM download_jobs
+                        WHERE job_id=? AND output_identity=? AND status IN ({marks})""",
+                    (job_id, output_identity, *ACTIVE_STATUSES),
+                )
+            ).fetchone()
+            if not job:
+                await db.commit()
+                return None
+            existing = await (
+                await db.execute(
+                    """SELECT subscriber_id FROM job_subscribers
+                       WHERE job_id=? AND user_id=? AND chat_id=?
+                         AND (message_id=? OR (message_id IS NULL AND ? IS NULL))
+                         AND status='waiting' LIMIT 1""",
+                    (job_id, int(user_id), int(chat_id), message_id, message_id),
+                )
+            ).fetchone()
+            if existing:
+                await db.commit()
+                return str(existing["subscriber_id"])
             if await self.count_active_jobs_for_user(user_id, connection=db) >= max_queued_jobs_per_user:
                 raise QueueLimitError(
                     "You already have the maximum number of active/queued downloads."
@@ -1011,6 +1159,59 @@ class Database:
         finally:
             await db.close()
 
+    async def finalize_delivery_if_idle(
+        self, job_id: str, delivered_any: bool
+    ) -> Optional[JobStatus]:
+        """Atomically close upload delivery or report that late recipients remain."""
+        db = await aiosqlite.connect(str(self.db_path), isolation_level=None)
+        db.row_factory = aiosqlite.Row
+        try:
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("BEGIN IMMEDIATE")
+            job = await (
+                await db.execute(
+                    "SELECT status FROM download_jobs WHERE job_id=?", (job_id,)
+                )
+            ).fetchone()
+            if not job:
+                await db.commit()
+                return JobStatus.FAILED
+            current = JobStatus(str(job["status"]))
+            if current != JobStatus.UPLOADING:
+                await db.commit()
+                return current
+            waiting = await (
+                await db.execute(
+                    "SELECT 1 FROM job_subscribers WHERE job_id=? AND status='waiting' LIMIT 1",
+                    (job_id,),
+                )
+            ).fetchone()
+            if waiting:
+                await db.commit()
+                return None
+            status = JobStatus.COMPLETED if delivered_any else JobStatus.FAILED
+            category = None if delivered_any else "telegram_delivery_failed"
+            message = (
+                None if delivered_any else
+                "Telegram could not deliver the completed media. Please try again."
+            )
+            await db.execute(
+                """UPDATE download_jobs SET status=?,current_stage=?,error_category=?,
+                   error_message=?,claimed_at=NULL,updated_at=?
+                   WHERE job_id=? AND status=?""",
+                (
+                    status.value, "Completed" if delivered_any else "Failed",
+                    category, message, time.time(), job_id, JobStatus.UPLOADING.value,
+                ),
+            )
+            await db.commit()
+            return status
+        except BaseException:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
     async def list_job_subscribers(self, job_id: str) -> list[dict[str, Any]]:
         rows = await (
             await self.connection.execute(
@@ -1020,18 +1221,99 @@ class Database:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    async def get_waiting_subscriber(
+        self, job_id: str, user_id: int, chat_id: int, message_id: Optional[int]
+    ) -> Optional[dict[str, Any]]:
+        row = await (
+            await self.connection.execute(
+                """SELECT * FROM job_subscribers
+                   WHERE job_id=? AND user_id=? AND chat_id=?
+                     AND (message_id=? OR (message_id IS NULL AND ? IS NULL))
+                     AND status='waiting' ORDER BY created_at LIMIT 1""",
+                (job_id, int(user_id), int(chat_id), message_id, message_id),
+            )
+        ).fetchone()
+        return dict(row) if row else None
+
+    async def count_waiting_subscribers(self, job_id: str) -> int:
+        row = await (
+            await self.connection.execute(
+                "SELECT COUNT(*) AS total FROM job_subscribers WHERE job_id=? AND status='waiting'",
+                (job_id,),
+            )
+        ).fetchone()
+        return int(row["total"]) if row else 0
+
     async def mark_subscriber(self, subscriber_id: str, status: str) -> None:
         await self.connection.execute(
-            "UPDATE job_subscribers SET status=? WHERE subscriber_id=?", (status, subscriber_id)
+            "UPDATE job_subscribers SET status=? WHERE subscriber_id=? AND status='waiting'",
+            (status, subscriber_id),
         )
 
-    async def cancel_subscriber(self, subscriber_id: str, user_id: int) -> bool:
-        cursor = await self.connection.execute(
-            "UPDATE job_subscribers SET status='cancelled' "
-            "WHERE subscriber_id=? AND user_id=? AND status='waiting'",
-            (subscriber_id, int(user_id)),
-        )
-        return cursor.rowcount == 1
+    async def subscriber_is_waiting(self, subscriber_id: str) -> bool:
+        row = await (
+            await self.connection.execute(
+                "SELECT 1 FROM job_subscribers WHERE subscriber_id=? AND status='waiting'",
+                (subscriber_id,),
+            )
+        ).fetchone()
+        return row is not None
+
+    async def cancel_subscriber(self, subscriber_id: str, user_id: int) -> Optional[str]:
+        db = await aiosqlite.connect(str(self.db_path), isolation_level=None)
+        db.row_factory = aiosqlite.Row
+        try:
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("BEGIN IMMEDIATE")
+            row = await (
+                await db.execute(
+                    "SELECT job_id FROM job_subscribers WHERE subscriber_id=? AND user_id=? AND status='waiting'",
+                    (subscriber_id, int(user_id)),
+                )
+            ).fetchone()
+            if not row:
+                await db.commit()
+                return None
+            job_id = str(row["job_id"])
+            await db.execute(
+                "UPDATE job_subscribers SET status='cancelled' WHERE subscriber_id=? AND status='waiting'",
+                (subscriber_id,),
+            )
+            waiting = await (
+                await db.execute(
+                    "SELECT 1 FROM job_subscribers WHERE job_id=? AND status='waiting' LIMIT 1",
+                    (job_id,),
+                )
+            ).fetchone()
+            if not waiting:
+                marks = ",".join("?" for _ in ACTIVE_STATUSES)
+                await db.execute(
+                    f"""UPDATE download_jobs SET status=?,current_stage='Cancelled',
+                        claimed_at=NULL,updated_at=? WHERE job_id=? AND status IN ({marks})""",
+                    (JobStatus.CANCELLED.value, time.time(), job_id, *ACTIVE_STATUSES),
+                )
+            await db.commit()
+            return job_id
+        except BaseException:
+            await db.rollback()
+            raise
+        finally:
+            await db.close()
+
+    async def cancel_waiting_subscriber_for_job(
+        self, job_id: str, user_id: int
+    ) -> Optional[str]:
+        row = await (
+            await self.connection.execute(
+                """SELECT subscriber_id FROM job_subscribers
+                   WHERE job_id=? AND user_id=? AND status='waiting'
+                   ORDER BY created_at LIMIT 1""",
+                (job_id, int(user_id)),
+            )
+        ).fetchone()
+        if not row:
+            return None
+        return await self.cancel_subscriber(str(row["subscriber_id"]), user_id)
 
     async def set_system_setting(self, key: str, value: str) -> None:
         await self.connection.execute(

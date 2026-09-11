@@ -52,13 +52,16 @@ class Downloader:
         stage: str = "download",
         direct_source: bool = False,
         raw_http: bool = False,
+        playlist_index: Optional[int] = None,
     ) -> Path:
         output_path = self.file_mgr.get_job_file_path(job_id, output_filename)
         if raw_http:
             return await self._download_http(
                 job_id, url, output_path, expected_size, on_progress
             )
-        command = self._build_ytdlp_command(url, format_id, output_path, direct_source)
+        command = self._build_ytdlp_command(
+            url, format_id, output_path, direct_source, playlist_index=playlist_index
+        )
 
         try:
             process = await self.supervisor.spawn_owned_process(
@@ -146,18 +149,24 @@ class Downloader:
         return actual_path
 
     def _build_ytdlp_command(
-        self, url: str, format_id: str, output_path: Path, direct_source: bool
+        self, url: str, format_id: str, output_path: Path, direct_source: bool,
+        *, playlist_index: Optional[int] = None,
     ) -> list[str]:
         command = [
             "yt-dlp",
             "-o",
             str(output_path),
-            "--no-playlist",
             "--no-warnings",
             "--ignore-config",
             "--no-cookies",
             "--newline",
+            "--progress-template",
+            "download:__AVDB_PROGRESS__|%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s",
         ]
+        if playlist_index is None:
+            command.append("--no-playlist")
+        else:
+            command.extend(("--playlist-items", str(playlist_index)))
         if not direct_source:
             command[1:1] = ["-f", format_id]
         if self.proxy_url:

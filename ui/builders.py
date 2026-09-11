@@ -209,8 +209,12 @@ def stream_status_text(fmt: MediaFormat) -> str:
 
 
 def build_preferred_media_text(
-    session: MediaSession, result: FavoriteMatchResult
+    session: MediaSession, result: FavoriteMatchResult, page: int = 0,
+    page_size: int = 6,
 ) -> str:
+    pages = max(1, math.ceil(len(result.formats) / page_size))
+    page = max(0, min(page, pages - 1))
+    visible_formats = result.formats[page * page_size:(page + 1) * page_size]
     videos = sum(1 for fmt in session.formats if fmt.is_video)
     lines = [
         "🎬 <b>Media Found</b>", "",
@@ -218,11 +222,11 @@ def build_preferred_media_text(
         f"<b>Source:</b> {escape(session.extractor)}",
         f"<b>Duration:</b> {_duration(session.duration)}",
         f"<b>Video formats discovered:</b> {videos}", "",
-        "<b>Your preferred formats:</b>",
+        f"<b>Your preferred formats</b> · Page {page + 1} / {pages}",
     ]
     if not result.formats:
         lines.append("No enabled favorite rule has an exact match in this source.")
-    for fmt in result.formats:
+    for fmt in visible_formats:
         lines.extend(("", f"⭐ <b>{escape(format_button_label(fmt))}</b>", stream_status_text(fmt)))
     if result.total_combinations:
         available = result.total_combinations - result.unavailable_combinations
@@ -232,13 +236,28 @@ def build_preferred_media_text(
 
 
 def build_preferred_keyboard(
-    session: MediaSession, result: FavoriteMatchResult
+    session: MediaSession, result: FavoriteMatchResult, page: int = 0,
+    page_size: int = 6,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for fmt in result.formats:
+    pages = max(1, math.ceil(len(result.formats) / page_size))
+    page = max(0, min(page, pages - 1))
+    for fmt in result.formats[page * page_size:(page + 1) * page_size]:
         builder.row(InlineKeyboardButton(
             text=format_button_label(fmt), callback_data=f"detail:{session.session_id}:{fmt.internal_key}"
         ))
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                text="◀️", callback_data=f"preferred:{session.session_id}:{page - 1}"
+            ))
+        nav.append(InlineKeyboardButton(text=f"{page + 1} / {pages}", callback_data="noop"))
+        if page + 1 < pages:
+            nav.append(InlineKeyboardButton(
+                text="▶️", callback_data=f"preferred:{session.session_id}:{page + 1}"
+            ))
+        builder.row(*nav)
     builder.row(InlineKeyboardButton(text="🎞 Browse All Formats", callback_data=f"all:{session.session_id}:0"))
     builder.row(
         InlineKeyboardButton(text="🎵 Audio Only", callback_data=f"audio:{session.session_id}"),
@@ -246,7 +265,7 @@ def build_preferred_keyboard(
     )
     builder.row(
         InlineKeyboardButton(text="ℹ️ Media Info", callback_data=f"info:{session.session_id}"),
-        InlineKeyboardButton(text="⚙️ Settings", callback_data="settings"),
+        InlineKeyboardButton(text="⚙️ Settings", callback_data=f"settings:{session.session_id}"),
     )
     if session.subtitles:
         builder.row(InlineKeyboardButton(text="💬 Subtitles", callback_data=f"assets:{session.session_id}:sub"))
@@ -263,12 +282,17 @@ def _duration(value: int | None) -> str:
 
 
 def build_format_details_text(
-    fmt: MediaFormat, audio: MediaFormat | None, style: str = "rich"
+    fmt: MediaFormat, audio: MediaFormat | None, style: str = "rich",
+    *, manual_audio_required: bool = False,
 ) -> str:
     if style == "compact":
+        audio_note = (
+            "\n\n🎵 Manual audio selection required. Expected download depends on selected audio."
+            if manual_audio_required else ""
+        )
         return (
             f"🎞 <b>Selected Format</b>\n\n{escape(format_button_label(fmt))}\n"
-            f"{stream_status_text(fmt)}\n\nNo compression or re-encoding will occur."
+            f"{stream_status_text(fmt)}{audio_note}\n\nNo compression or re-encoding will occur."
         )
     total = fmt.effective_size
     exact = fmt.is_exact_size
@@ -276,10 +300,15 @@ def build_format_details_text(
         total = total + audio.effective_size if total is not None and audio.effective_size is not None else None
         exact = exact and audio.is_exact_size
     total_text = "Unknown" if total is None else ("" if exact else "~") + f"{total / 1024**2:.1f} MB"
-    audio_text = "Already included" if fmt.is_muxed else (
+    audio_text = "Manual audio selection required" if manual_audio_required else ("Already included" if fmt.is_muxed else (
         f"{audio.audio_language or 'Unknown language'} · {audio.acodec_normalized.value} · "
         f"{audio.abr:g} kbps" if audio and audio.abr else
         (f"{audio.audio_language or 'Unknown language'} · {audio.acodec_normalized.value}" if audio else "Unavailable")
+    ))
+    expected_text = "Depends on selected audio" if manual_audio_required else total_text
+    audio_size_text = (
+        "Choose an exact stream" if manual_audio_required else
+        (audio.format_size_display() if audio else ('Included' if fmt.is_muxed else 'Unknown'))
     )
     dimensions = f"{fmt.width}×{fmt.height}" if fmt.width and fmt.height else "Unknown dimensions"
     fps_text = f"{fmt.fps:g} FPS" if fmt.fps is not None else "Unknown FPS"
@@ -293,19 +322,23 @@ def build_format_details_text(
         f"Format ID: <code>{escape(fmt.format_id)}</code>\n\n"
         f"<b>Audio</b>\n{escape(audio_text)}\n\n"
         f"<b>Size</b>\nVideo: {fmt.format_size_display()}\n"
-        f"Audio: {audio.format_size_display() if audio else ('Included' if fmt.is_muxed else 'Unknown')}\n"
-        f"Expected download: {total_text}\n\n<b>Processing</b>\n{stream_status_text(fmt)}\n\n"
+        f"Audio: {audio_size_text}\n"
+        f"Expected download: {expected_text}\n\n<b>Processing</b>\n{stream_status_text(fmt)}\n\n"
         "The original streams are preserved. No compression, conversion or re-encoding will occur."
     )
 
 
 def build_format_details_keyboard(
-    session: MediaSession, fmt: MediaFormat, *, back: str = "preferred"
+    session: MediaSession, fmt: MediaFormat, *, back: str = "preferred",
+    manual_audio_required: bool = False,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="⬇️ Download", callback_data=f"fmt:{session.session_id}:{fmt.internal_key}"))
     if fmt.requires_separate_audio:
-        builder.row(InlineKeyboardButton(text="🎵 Audio Options", callback_data=f"audopts:{session.session_id}:{fmt.internal_key}"))
+        builder.row(InlineKeyboardButton(
+            text="🎵 Choose Audio" if manual_audio_required else "🎵 Audio Options",
+            callback_data=f"audopts:{session.session_id}:{fmt.internal_key}",
+        ))
     back_data = f"preferred:{session.session_id}" if back == "preferred" else f"all:{session.session_id}:0"
     builder.row(InlineKeyboardButton(text="🔙 Back", callback_data=back_data))
     return builder.as_markup()
@@ -405,26 +438,35 @@ def build_settings_text(settings: UserSettings) -> str:
     )
 
 
-def build_settings_keyboard(settings: UserSettings) -> InlineKeyboardMarkup:
+def build_settings_keyboard(
+    settings: UserSettings, media_session_id: str | None = None
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    def setting_callback(category: str, value: str) -> str:
+        base = f"set:{category}:{value}"
+        return f"{base}:{media_session_id}" if media_session_id else base
     builder.row(
-        InlineKeyboardButton(text=("● Video" if settings.send_mode == "video" else "○ Video"), callback_data="set:send:video"),
-        InlineKeyboardButton(text=("● Document" if settings.send_mode == "document" else "○ Document"), callback_data="set:send:document"),
+        InlineKeyboardButton(text=("● Video" if settings.send_mode == "video" else "○ Video"), callback_data=setting_callback("send", "video")),
+        InlineKeyboardButton(text=("● Document" if settings.send_mode == "document" else "○ Document"), callback_data=setting_callback("send", "document")),
     )
     builder.row(InlineKeyboardButton(text="⭐ Favorite Formats", callback_data="favorites"))
     for value, label in (("best_quality", "Best quality"), ("smallest_file", "Smallest file"), ("prefer_ready", "Prefer ready/muxed")):
         builder.row(InlineKeyboardButton(
             text=("● " if settings.matching_strategy.value == value else "○ ") + label,
-            callback_data=f"set:strategy:{value}",
+            callback_data=setting_callback("strategy", value),
         ))
     builder.row(
-        InlineKeyboardButton(text=("● Rich" if settings.detail_style.value == "rich" else "○ Rich"), callback_data="set:detail:rich"),
-        InlineKeyboardButton(text=("● Compact" if settings.detail_style.value == "compact" else "○ Compact"), callback_data="set:detail:compact"),
+        InlineKeyboardButton(text=("● Rich" if settings.detail_style.value == "rich" else "○ Rich"), callback_data=setting_callback("detail", "rich")),
+        InlineKeyboardButton(text=("● Compact" if settings.detail_style.value == "compact" else "○ Compact"), callback_data=setting_callback("detail", "compact")),
     )
     builder.row(InlineKeyboardButton(
         text=("● Automatic audio" if settings.automatic_audio else "○ Automatic audio"),
-        callback_data="set:auto_audio:toggle",
+        callback_data=setting_callback("auto_audio", "toggle"),
     ))
+    if media_session_id:
+        builder.row(InlineKeyboardButton(
+            text="🔙 Back to Media", callback_data=f"preferred:{media_session_id}:0"
+        ))
     return builder.as_markup()
 
 
@@ -545,22 +587,38 @@ def build_collection_keyboard(session: MediaSession, page: int = 0) -> InlineKey
     ))
     if session.session_kind == "multimedia":
         builder.row(InlineKeyboardButton(
-            text="📦 Download All Original Media", callback_data=f"items:{session.session_id}:all"
+            text="📦 Download All Media", callback_data=f"allmedia:{session.session_id}"
         ))
     builder.row(InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel_session:{session.session_id}"))
     return builder.as_markup()
 
 
 def build_item_selection_keyboard(
-    session: MediaSession, selected: list[str]
+    session: MediaSession, selected: list[str], page: int = 0,
+    page_size: int = 15,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for index, item in enumerate(session.items[:30], 1):
+    pages = max(1, math.ceil(len(session.items) / page_size))
+    page = max(0, min(page, pages - 1))
+    visible = session.items[page * page_size:(page + 1) * page_size]
+    for index, item in enumerate(visible, page * page_size + 1):
         mark = "☑" if item.item_id in selected else "☐"
         builder.button(
-            text=f"{mark} {index}", callback_data=f"itoggle:{session.session_id}:{item.item_id}"
+            text=f"{mark} {index}", callback_data=f"itoggle:{session.session_id}:{item.item_id}:{page}"
         )
     builder.adjust(3)
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                text="◀️", callback_data=f"iselect:{session.session_id}:{page - 1}"
+            ))
+        nav.append(InlineKeyboardButton(text=f"{page + 1} / {pages}", callback_data="noop"))
+        if page + 1 < pages:
+            nav.append(InlineKeyboardButton(
+                text="▶️", callback_data=f"iselect:{session.session_id}:{page + 1}"
+            ))
+        builder.row(*nav)
     builder.row(InlineKeyboardButton(text="▶️ Process selected", callback_data=f"iprocess:{session.session_id}"))
     builder.row(InlineKeyboardButton(text="🔙 Back", callback_data=f"collection:{session.session_id}"))
     return builder.as_markup()

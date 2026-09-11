@@ -40,6 +40,8 @@ async def submit_exact_selection(
     preferences = await db.get_user_settings(user_id)
     send_mode = preferences.send_mode if media_kind == "video" else "document"
     if media_kind == "video" and primary.requires_separate_audio and audio is None:
+        if not preferences.automatic_audio:
+            raise ValueError("Manual audio selection is required for this video format")
         audio = select_default_audio(session.formats, primary)
     if media_kind == "video" and primary.requires_separate_audio and audio is None:
         raise ValueError("No companion audio stream is available")
@@ -100,4 +102,10 @@ async def submit_exact_selection(
         )
         return SelectionResult("coalesced", job=active, subscriber_id=subscriber_id)
     scheduler.wake()
-    return SelectionResult("queued", job=job)
+    recipient = await db.get_waiting_subscriber(
+        job.job_id, user_id, chat_id, message_id
+    )
+    return SelectionResult(
+        "queued", job=job,
+        subscriber_id=recipient["subscriber_id"] if recipient else None,
+    )
