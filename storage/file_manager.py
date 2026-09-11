@@ -1,0 +1,83 @@
+"""Symlink-safe isolated filesystem management for download jobs."""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+from pathlib import Path
+
+from core.exceptions import SecurityError
+
+_SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_SAFE_EXTENSION = re.compile(r"^[a-z0-9]{1,10}$")
+
+
+def safe_extension(value: str, fallback: str = "bin") -> str:
+    candidate = (value or "").lower().lstrip(".")
+    return candidate if _SAFE_EXTENSION.fullmatch(candidate) else fallback
+
+
+class FileManager:
+    def __init__(self, base_jobs_dir: Path):
+        Path(base_jobs_dir).mkdir(parents=True, exist_ok=True)
+        self.base_jobs_dir = Path(base_jobs_dir).resolve(strict=True)
+        if self.base_jobs_dir.is_symlink():
+            raise SecurityError("Jobs base directory may not be a symlink")
+
+    def _validate_job_id(self, job_id: str) -> None:
+        if not _SAFE_COMPONENT.fullmatch(job_id):
+            raise SecurityError("Invalid job identifier")
+
+    def get_job_dir(self, job_id: str, *, create: bool = True) -> Path:
+        self._validate_job_id(job_id)
+        lexical = self.base_jobs_dir / job_id
+        if lexical.exists() and lexical.is_symlink():
+            raise SecurityError("Job directory symlink is forbidden")
+        if create:
+            lexical.mkdir(mode=0o700, parents=False, exist_ok=True)
+        resolved = lexical.resolve(strict=create)
+        if not resolved.is_relative_to(self.base_jobs_dir):
+            raise SecurityError("Job directory escaped the configured storage root")
+        return resolved
+
+    def get_job_file_path(self, job_id: str, filename: str) -> Path:
+        if not filename or Path(filename).name != filename:
+            raise SecurityError("Invalid job filename")
+        job_dir = self.get_job_dir(job_id)
+        candidate = job_dir / filename
+        if candidate.exists() and candidate.is_symlink():
+            raise SecurityError("Output symlinks are forbidden")
+        resolved_parent = candidate.parent.resolve(strict=True)
+        if resolved_parent != job_dir or not resolved_parent.is_relative_to(self.base_jobs_dir):
+            raise SecurityError("Output path escaped the job directory")
+        return candidate
+
+    def job_disk_usage(self, job_id: str) -> int:
+        job_dir = self.get_job_dir(job_id, create=False)
+        total = 0
+        with os.scandir(job_dir) as entries:
+            for entry in entries:
+                if entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+        return total
+
+    def cleanup_job(self, job_id: str) -> bool:
+        self._validate_job_id(job_id)
+        lexical = self.base_jobs_dir / job_id
+        if not lexical.exists() and not lexical.is_symlink():
+            return False
+        if lexical.is_symlink():
+            lexical.unlink()
+            return True
+        resolved = lexical.resolve(strict=True)
+        if not resolved.is_relative_to(self.base_jobs_dir) or resolved == self.base_jobs_dir:
+            raise SecurityError("Refusing unsafe cleanup target")
+        shutil.rmtree(resolved)
+        return True
+
+    def get_free_disk_space(self) -> int:
+        return shutil.disk_usage(self.base_jobs_dir).free
+
+    def get_disk_capacity(self) -> int:
+        return shutil.disk_usage(self.base_jobs_dir).total

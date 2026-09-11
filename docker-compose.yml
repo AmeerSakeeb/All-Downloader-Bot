@@ -1,0 +1,24 @@
+services:
+  bot:
+    build: .
+    container_name: any-video-downloader-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - bot_data:/app/data
+      - bot_logs:/app/logs
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=100M,noexec,nosuid,nodev
+
+networks:
+  default:
+    name: video-downloader-network
+    driver: bridge
+
+volumes:
+  bot_data:
+  bot_logs:
