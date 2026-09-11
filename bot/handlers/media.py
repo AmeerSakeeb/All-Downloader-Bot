@@ -56,15 +56,18 @@ async def handle_potential_url(
     text = message.text or ""
     urls = extract_urls_from_text(text)
     if not urls:
-        draft = await db.get_ui_draft(message.from_user.id)
+        draft = await db.get_ui_draft(message.from_user.id, "format-search")
         if draft and draft.get("kind") == "format_search":
             session = await db.get_media_session(str(draft.get("session_id") or ""))
             if session and session.user_id == message.from_user.id and not session.is_expired():
-                filters = dict(draft.get("filters") or {})
+                draft_key = f"filters:{session.session_id}"
+                filter_draft = await db.get_ui_draft(message.from_user.id, draft_key)
+                filters = dict((filter_draft or {}).get("filters") or {})
                 filters["query"] = text.strip()[:80]
-                await db.save_ui_draft(message.from_user.id, {
+                await db.save_ui_draft(message.from_user.id, draft_key, {
                     "kind": "filters", "session_id": session.session_id, "filters": filters,
                 })
+                await db.delete_ui_draft(message.from_user.id, "format-search")
                 await message.reply(
                     f"🔎 <b>Format search:</b> {escape(filters['query'])}",
                     reply_markup=build_all_formats_keyboard(session, filters, 0),

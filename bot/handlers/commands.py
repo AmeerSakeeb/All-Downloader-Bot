@@ -54,6 +54,7 @@ async def cmd_settings(message: Message, db: Database):
     if not message.from_user:
         return
     preferences = await db.get_user_settings(message.from_user.id)
+    await db.delete_ui_draft(message.from_user.id, "favorites-context")
     await message.reply(
         build_settings_text(preferences), reply_markup=build_settings_keyboard(preferences)
     )

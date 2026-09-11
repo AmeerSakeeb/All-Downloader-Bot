@@ -6,6 +6,8 @@ SAFE_USER_CATEGORIES = {
     "authentication_required", "drm_unsupported", "media_unavailable",
     "unsupported_url", "insufficient_disk", "lossless_merge_unavailable",
     "exact_format_disappeared", "delivery_size_exceeded", "access_denied",
+    "telegram_delivery_failed",
+    "extraction_timeout", "site_access_challenge",
 }
 
 

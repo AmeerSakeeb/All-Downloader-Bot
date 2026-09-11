@@ -15,6 +15,7 @@ from core.config import Settings, get_settings
 from core.exceptions import DownloadError, InsufficientDiskSpaceError
 from downloads.process_supervisor import ProcessSupervisor
 from downloads.progress import ProgressTracker
+from services.ytdlp_policy import CookieFileUnavailableError, YtDlpPolicy
 from storage.file_manager import FileManager
 
 ProgressCallback = Callable[
@@ -53,15 +54,23 @@ class Downloader:
         direct_source: bool = False,
         raw_http: bool = False,
         playlist_index: Optional[int] = None,
+        impersonate: bool = False,
     ) -> Path:
         output_path = self.file_mgr.get_job_file_path(job_id, output_filename)
         if raw_http:
             return await self._download_http(
                 job_id, url, output_path, expected_size, on_progress
             )
-        command = self._build_ytdlp_command(
-            url, format_id, output_path, direct_source, playlist_index=playlist_index
-        )
+        try:
+            command = self._build_ytdlp_command(
+                url, format_id, output_path, direct_source,
+                playlist_index=playlist_index, impersonate=impersonate,
+            )
+        except CookieFileUnavailableError as error:
+            raise DownloadError(
+                "Configured yt-dlp cookie file is unavailable",
+                user_message="The operator-managed authorized session is unavailable.",
+            ) from error
 
         try:
             process = await self.supervisor.spawn_owned_process(
@@ -150,27 +159,28 @@ class Downloader:
 
     def _build_ytdlp_command(
         self, url: str, format_id: str, output_path: Path, direct_source: bool,
-        *, playlist_index: Optional[int] = None,
+        *, playlist_index: Optional[int] = None, impersonate: bool = False,
     ) -> list[str]:
         command = [
             "yt-dlp",
             "-o",
             str(output_path),
             "--no-warnings",
-            "--ignore-config",
-            "--no-cookies",
             "--newline",
             "--progress-template",
             "download:__AVDB_PROGRESS__|%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s",
         ]
+        command.extend(
+            YtDlpPolicy(self.settings, self.proxy_url).common_args(
+                impersonate=impersonate
+            )
+        )
         if playlist_index is None:
             command.append("--no-playlist")
         else:
             command.extend(("--playlist-items", str(playlist_index)))
         if not direct_source:
             command[1:1] = ["-f", format_id]
-        if self.proxy_url:
-            command.extend(("--proxy", self.proxy_url))
         if self.settings.resume_enabled:
             command.append("--continue")
         if self.settings.max_retries > 0:

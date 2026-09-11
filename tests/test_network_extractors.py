@@ -1,8 +1,10 @@
+import asyncio
 import ipaddress
 import json
 
 import pytest
 
+from core.exceptions import AuthenticationRequiredError, ExtractionTimeoutError
 from core.models import AudioCodec, VideoCodec
 from downloads.process_supervisor import ProcessResult
 from extractors.direct_extractor import DirectMediaExtractor
@@ -53,6 +55,67 @@ async def test_ytdlp_extractions_use_independent_operation_owners(monkeypatch, s
     await extractor.extract("https://example.com/a", 1, operation_id="analysis-a")
     await extractor.extract("https://example.com/b", 1, operation_id="analysis-b")
     assert supervisor.owners == ["analysis-a", "analysis-b"]
+
+
+@pytest.mark.asyncio
+async def test_ytdlp_retries_access_challenge_once_with_impersonation(monkeypatch, settings):
+    class Supervisor:
+        def __init__(self):
+            self.commands = []
+
+        async def run(self, command, **kwargs):
+            self.commands.append(command)
+            if len(self.commands) == 1:
+                return ProcessResult(1, b"", b"HTTP Error 403: Forbidden")
+            payload = {"formats": [{"format_id": "v", "vcodec": "h264", "acodec": "aac"}]}
+            return ProcessResult(0, json.dumps(payload).encode(), b"")
+
+    supervisor = Supervisor()
+    monkeypatch.setattr("extractors.ytdlp_extractor.SSRFGuard.validate_url", lambda url: [])
+    extractor = YtDlpExtractor(settings=settings, supervisor=supervisor, proxy_url="http://proxy")
+    session = await extractor.extract("https://example.com/video", 1)
+
+    assert len(supervisor.commands) == 2
+    assert "--impersonate" not in supervisor.commands[0]
+    assert "--impersonate" in supervisor.commands[1]
+    assert all("--proxy" in command for command in supervisor.commands)
+    assert session.ytdlp_impersonated is True
+
+
+@pytest.mark.asyncio
+async def test_ytdlp_does_not_retry_authentication_failure(monkeypatch, settings):
+    class Supervisor:
+        calls = 0
+
+        async def run(self, command, **kwargs):
+            self.calls += 1
+            return ProcessResult(1, b"", b"Login required. Use --cookies")
+
+    supervisor = Supervisor()
+    monkeypatch.setattr("extractors.ytdlp_extractor.SSRFGuard.validate_url", lambda url: [])
+    extractor = YtDlpExtractor(settings=settings, supervisor=supervisor, proxy_url="http://proxy")
+
+    with pytest.raises(AuthenticationRequiredError):
+        await extractor.extract("https://example.com/private", 1)
+    assert supervisor.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_ytdlp_timeout_attempts_are_bounded(monkeypatch, settings):
+    class Supervisor:
+        calls = 0
+
+        async def run(self, command, **kwargs):
+            self.calls += 1
+            raise asyncio.TimeoutError
+
+    supervisor = Supervisor()
+    monkeypatch.setattr("extractors.ytdlp_extractor.SSRFGuard.validate_url", lambda url: [])
+    extractor = YtDlpExtractor(settings=settings, supervisor=supervisor, proxy_url="http://proxy")
+
+    with pytest.raises(ExtractionTimeoutError):
+        await extractor.extract("https://example.com/slow", 1)
+    assert supervisor.calls == 2
 
 
 @pytest.mark.asyncio

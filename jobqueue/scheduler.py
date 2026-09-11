@@ -23,7 +23,7 @@ from storage.database import Database
 from storage.file_manager import FileManager, safe_extension
 
 ProgressHandler = Callable[[DownloadJob], Awaitable[None] | None]
-UploadHandler = Callable[[Path, DownloadJob], Awaitable[None]]
+UploadHandler = Callable[[Path, DownloadJob], Awaitable[bool | None]]
 ExtractorFactory = Callable[[str], Awaitable[Extractor]]
 
 
@@ -102,12 +102,13 @@ class JobScheduler:
         job = await self.db.get_job(job_id)
         if not job or (user_id is not None and job.user_id != user_id):
             return False
-        if job.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
-            return job.status == JobStatus.CANCELLED
-        job.status = JobStatus.CANCELLED
-        job.current_stage = "Cancelled"
-        job.claimed_at = None
-        await self.db.save_job(job)
+        if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
+            return False
+        if job.status != JobStatus.CANCELLED:
+            job.status = JobStatus.CANCELLED
+            job.current_stage = "Cancelled"
+            job.claimed_at = None
+            await self.db.save_job(job)
         await self.queue_mgr.supervisor.cancel_job(job_id)
         task = self._running.get(job_id)
         if task and not task.done():
@@ -285,11 +286,32 @@ class JobScheduler:
                 await self.db.save_job(job)
                 if not upload:
                     raise RuntimeError("No Telegram upload handler is configured")
-                await upload(final_path, job)
-                await self.db.save_job(job)
-            await self._raise_if_cancelled(job_id)
-            await self._set_status(job, JobStatus.COMPLETED, "Completed")
-            terminal = True
+                delivered_any = False
+                while True:
+                    round_result = await upload(final_path, job)
+                    # Existing embedding/test upload handlers predate recipient
+                    # outcomes; a successful legacy None result represents
+                    # delivery to its current waiting recipient set.
+                    if round_result is None:
+                        for recipient in await self.db.list_job_subscribers(job.job_id):
+                            await self.db.mark_subscriber(
+                                recipient["subscriber_id"], "delivered"
+                            )
+                    delivered_any = delivered_any or round_result is not False
+                    await self.db.save_job(job)
+                    final_status = await self.db.finalize_delivery_if_idle(
+                        job.job_id, delivered_any
+                    )
+                    if final_status is None:
+                        continue
+                    current = await self.db.get_job(job.job_id)
+                    if current:
+                        job = current
+                    await self._notify(job, progress)
+                    terminal = final_status in {
+                        JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED,
+                    }
+                    break
         except asyncio.CancelledError:
             current = await self.db.get_job(job_id)
             if current and current.status != JobStatus.CANCELLED:
@@ -356,16 +378,17 @@ class JobScheduler:
                 job.video_format_id,
                 video_path.name,
                 video.effective_size,
-            video_progress,
-            pid_update,
-            "download-video",
-            direct_source=job.extractor == "direct",
-            raw_http=job.media_kind == "asset",
-            **(
-                {"playlist_index": job.collection_entry_index}
-                if job.collection_entry_index is not None else {}
-            ),
-        )
+                video_progress,
+                pid_update,
+                "download-video",
+                direct_source=job.extractor == "direct",
+                raw_http=job.media_kind == "asset",
+                **(
+                    {"playlist_index": job.collection_entry_index}
+                    if job.collection_entry_index is not None else {}
+                ),
+                **({"impersonate": True} if job.ytdlp_impersonated else {}),
+            )
         if not audio:
             return video_path
         audio_path = self.file_mgr.get_job_file_path(
@@ -386,6 +409,7 @@ class JobScheduler:
                     {"playlist_index": job.collection_entry_index}
                     if job.collection_entry_index is not None else {}
                 ),
+                **({"impersonate": True} if job.ytdlp_impersonated else {}),
             )
         return video_path
 
@@ -418,7 +442,11 @@ class JobScheduler:
             async with lease:
                 extractor = await factory(job.source_url)
                 refreshed: MediaSession = await extractor.extract(
-                    job.source_url, job.user_id, operation_id=job.job_id
+                    job.source_url, job.user_id, operation_id=job.job_id,
+                    **(
+                        {"prefer_impersonation": True}
+                        if job.ytdlp_impersonated else {}
+                    ),
                 )
             inventory = refreshed.formats
             if job.collection_entry_index is not None:

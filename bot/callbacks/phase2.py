@@ -164,10 +164,11 @@ async def details(callback: CallbackQuery, db: Database) -> None:
 
 
 async def _filters(db: Database, user_id: int, session_id: str) -> dict[str, Any]:
-    draft = await db.get_ui_draft(user_id)
+    draft_key = f"filters:{session_id}"
+    draft = await db.get_ui_draft(user_id, draft_key)
     if not draft or draft.get("kind") != "filters" or draft.get("session_id") != session_id:
         draft = {"kind": "filters", "session_id": session_id, "filters": {}}
-        await db.save_ui_draft(user_id, draft)
+        await db.save_ui_draft(user_id, draft_key, draft)
     return draft["filters"]
 
 
@@ -224,7 +225,10 @@ async def filter_toggle(callback: CallbackQuery, db: Database) -> None:
         values = [item for item in values if item != value] if value in values else values + [value]
         values = values or ["any"]
     filters[parts[2]] = values
-    await db.save_ui_draft(callback.from_user.id, {"kind": "filters", "session_id": parts[1], "filters": filters})
+    await db.save_ui_draft(
+        callback.from_user.id, f"filters:{parts[1]}",
+        {"kind": "filters", "session_id": parts[1], "filters": filters},
+    )
     await cast(Any, callback.message).edit_reply_markup(
         reply_markup=build_filter_keyboard(parts[1], parts[2], values)
     )
@@ -236,7 +240,10 @@ async def filter_reset(callback: CallbackQuery, db: Database) -> None:
     session_id = (callback.data or "").split(":", 1)[-1]
     session = await _owned(callback, db, session_id)
     if session:
-        await db.save_ui_draft(callback.from_user.id, {"kind": "filters", "session_id": session_id, "filters": {}})
+        await db.save_ui_draft(
+            callback.from_user.id, f"filters:{session_id}",
+            {"kind": "filters", "session_id": session_id, "filters": {}},
+        )
         await cast(Any, callback.message).edit_reply_markup(
             reply_markup=build_all_formats_keyboard(session, {}, 0)
         )
@@ -250,8 +257,8 @@ async def search_formats(callback: CallbackQuery, db: Database) -> None:
     if not session:
         return
     filters = await _filters(db, callback.from_user.id, session_id)
-    await db.save_ui_draft(callback.from_user.id, {
-        "kind": "format_search", "session_id": session_id, "filters": filters,
+    await db.save_ui_draft(callback.from_user.id, "format-search", {
+        "kind": "format_search", "session_id": session_id,
     })
     await cast(Any, callback.message).edit_text(
         "🔎 <b>Search formats</b>\n\nSend a codec, resolution, FPS, container or exact format ID."
@@ -409,6 +416,13 @@ async def settings_panel(callback: CallbackQuery, db: Database) -> None:
     media_session_id = parts[1] if len(parts) == 2 else None
     if media_session_id and not await _owned(callback, db, media_session_id):
         return
+    if media_session_id:
+        await db.save_ui_draft(
+            callback.from_user.id, "favorites-context",
+            {"media_session_id": media_session_id},
+        )
+    else:
+        await db.delete_ui_draft(callback.from_user.id, "favorites-context")
     settings = await db.get_user_settings(callback.from_user.id)
     await cast(Any, callback.message).edit_text(
         build_settings_text(settings),
@@ -452,7 +466,12 @@ async def favorites(callback: CallbackQuery, db: Database) -> None:
     if not await _authorized(callback, db):
         return
     rules = await db.ensure_default_favorite_rules(callback.from_user.id)
-    await cast(Any, callback.message).edit_text(build_favorites_text(rules), reply_markup=build_favorites_keyboard(rules))
+    context = await db.get_ui_draft(callback.from_user.id, "favorites-context")
+    media_session_id = str(context.get("media_session_id")) if context and context.get("media_session_id") else None
+    await cast(Any, callback.message).edit_text(
+        build_favorites_text(rules),
+        reply_markup=build_favorites_keyboard(rules, media_session_id),
+    )
     await callback.answer()
 
 
@@ -535,7 +554,12 @@ async def favorite_operation(callback: CallbackQuery, db: Database) -> None:
     elif action == "delete":
         await db.delete_favorite_rule(rule.rule_id, rule.user_id)
     rules = await db.ensure_default_favorite_rules(callback.from_user.id)
-    await cast(Any, callback.message).edit_text(build_favorites_text(rules), reply_markup=build_favorites_keyboard(rules))
+    context = await db.get_ui_draft(callback.from_user.id, "favorites-context")
+    media_session_id = str(context.get("media_session_id")) if context and context.get("media_session_id") else None
+    await cast(Any, callback.message).edit_text(
+        build_favorites_text(rules),
+        reply_markup=build_favorites_keyboard(rules, media_session_id),
+    )
     await callback.answer("Updated")
 
 
@@ -577,6 +601,7 @@ async def _child_session(
             parent_collection_url=item.parent_collection_url if uses_parent else None,
             collection_entry_index=item.collection_entry_index if uses_parent else None,
             collection_entry_id=item.collection_entry_id if uses_parent else None,
+            ytdlp_impersonated=parent.ytdlp_impersonated,
         )
     lease, _ = await governor.acquire_stage("extraction")
     if not lease:
@@ -585,7 +610,11 @@ async def _child_session(
         await asyncio.to_thread(SSRFGuard.validate_url, item.source_url)
         extractor = await registry.get_extractor_for_url(item.source_url)
         return await extractor.extract(
-            item.source_url, user_id, operation_id=f"collection-{uuid.uuid4().hex}"
+            item.source_url, user_id, operation_id=f"collection-{uuid.uuid4().hex}",
+            **(
+                {"prefer_impersonation": True}
+                if parent.ytdlp_impersonated else {}
+            ),
         )
 
 
@@ -669,7 +698,7 @@ async def prepare_download_all(
         })
         lines.append(f"{index}. 🎞 {escape(format_button_label(primary))}")
     lines.extend(("", f"Ready to queue: {len(choices)}", f"Needs selection: {len(missing)}"))
-    await db.save_ui_draft(callback.from_user.id, {
+    await db.save_ui_draft(callback.from_user.id, f"download-all:{session.session_id}", {
         "kind": "download_all", "session_id": session.session_id,
         "choices": choices, "missing": missing,
     })
@@ -696,7 +725,7 @@ async def choose_missing_formats(callback: CallbackQuery, db: Database) -> None:
     session_id = (callback.data or "").split(":", 1)[-1]
     if not await _owned(callback, db, session_id) or not callback.message:
         return
-    draft = await db.get_ui_draft(callback.from_user.id)
+    draft = await db.get_ui_draft(callback.from_user.id, f"download-all:{session_id}")
     if not draft or draft.get("kind") != "download_all" or draft.get("session_id") != session_id:
         await callback.answer("This confirmation has expired.", show_alert=True)
         return
@@ -727,7 +756,7 @@ async def queue_download_all(
     session_id = (callback.data or "").split(":", 1)[-1]
     if not await _owned(callback, db, session_id) or not callback.message:
         return
-    draft = await db.get_ui_draft(callback.from_user.id)
+    draft = await db.get_ui_draft(callback.from_user.id, f"download-all:{session_id}")
     if not draft or draft.get("kind") != "download_all" or draft.get("session_id") != session_id:
         await callback.answer("This confirmation has expired.", show_alert=True)
         return
@@ -766,7 +795,7 @@ async def queue_download_all(
         except (QueueLimitError, ValueError):
             failed += 1
             await status_message.edit_text("❌ This exact item could not be queued.")
-    await db.delete_ui_draft(callback.from_user.id)
+    await db.delete_ui_draft(callback.from_user.id, f"download-all:{session_id}")
     await message.edit_text(
         f"📦 <b>Download All Media</b>\n\nQueued/delivered: {queued}\nNot queued: {failed}"
     )
@@ -775,7 +804,8 @@ async def queue_download_all(
 
 @router.callback_query(F.data.startswith("allcancel:"))
 async def cancel_download_all(callback: CallbackQuery, db: Database) -> None:
-    await db.delete_ui_draft(callback.from_user.id)
+    session_id = (callback.data or "").split(":", 1)[-1]
+    await db.delete_ui_draft(callback.from_user.id, f"download-all:{session_id}")
     if callback.message:
         await cast(Any, callback.message).edit_text("Download All Media cancelled.")
     await callback.answer("Cancelled")
@@ -821,10 +851,11 @@ async def select_items(callback: CallbackQuery, db: Database) -> None:
     session = await _owned(callback, db, parts[1]) if len(parts) in {2, 3} else None
     if session:
         page = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else 0
-        draft = await db.get_ui_draft(callback.from_user.id)
+        draft_key = f"items:{session.session_id}"
+        draft = await db.get_ui_draft(callback.from_user.id, draft_key)
         if not draft or draft.get("kind") != "items" or draft.get("session_id") != session.session_id:
             draft = {"kind": "items", "session_id": session.session_id, "selected": []}
-            await db.save_ui_draft(callback.from_user.id, draft)
+            await db.save_ui_draft(callback.from_user.id, draft_key, draft)
         await cast(Any, callback.message).edit_text(
             "☑ <b>Select media items</b>",
             reply_markup=build_item_selection_keyboard(session, list(draft.get("selected") or []), page),
@@ -840,7 +871,10 @@ async def select_first(callback: CallbackQuery, db: Database) -> None:
         return
     count = len(session.items) if parts[2] == "all" else min(int(parts[2]), len(session.items))
     selected = [item.item_id for item in session.items[:count]]
-    await db.save_ui_draft(callback.from_user.id, {"kind": "items", "session_id": session.session_id, "selected": selected})
+    await db.save_ui_draft(
+        callback.from_user.id, f"items:{session.session_id}",
+        {"kind": "items", "session_id": session.session_id, "selected": selected},
+    )
     await cast(Any, callback.message).edit_text(
         f"☑ <b>{count} items selected</b>", reply_markup=build_item_selection_keyboard(session, selected)
     )
@@ -851,13 +885,14 @@ async def select_first(callback: CallbackQuery, db: Database) -> None:
 async def item_toggle(callback: CallbackQuery, db: Database) -> None:
     parts = (callback.data or "").split(":")
     session = await _owned(callback, db, parts[1]) if len(parts) == 4 else None
-    draft = await db.get_ui_draft(callback.from_user.id)
+    draft_key = f"items:{parts[1]}"
+    draft = await db.get_ui_draft(callback.from_user.id, draft_key)
     if not session or not draft or draft.get("kind") != "items" or draft.get("session_id") != parts[1]:
         return
     selected = list(draft.get("selected") or [])
     selected = [item for item in selected if item != parts[2]] if parts[2] in selected else selected + [parts[2]]
     draft["selected"] = selected
-    await db.save_ui_draft(callback.from_user.id, draft)
+    await db.save_ui_draft(callback.from_user.id, draft_key, draft)
     page = int(parts[3]) if parts[3].isdigit() else 0
     await cast(Any, callback.message).edit_reply_markup(
         reply_markup=build_item_selection_keyboard(session, selected, page)
@@ -871,7 +906,8 @@ async def process_selected(
     governor: ResourceGovernor,
 ) -> None:
     session = await _owned(callback, db, (callback.data or "").split(":", 1)[-1])
-    draft = await db.get_ui_draft(callback.from_user.id)
+    draft_key = f"items:{session.session_id}" if session else "items:missing"
+    draft = await db.get_ui_draft(callback.from_user.id, draft_key)
     selected = set(draft.get("selected") or []) if draft and draft.get("kind") == "items" else set()
     if not session or not selected:
         await callback.answer("Select at least one item.", show_alert=True)
@@ -896,7 +932,7 @@ async def process_selected(
         else:
             text, markup = await _preferred(child, db)
             await cast(Any, callback.message).answer(text, reply_markup=markup)
-    await db.delete_ui_draft(callback.from_user.id)
+    await db.delete_ui_draft(callback.from_user.id, draft_key)
     await callback.answer("Prepared")
 
 

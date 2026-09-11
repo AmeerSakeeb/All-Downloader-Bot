@@ -51,61 +51,60 @@ async def submit_exact_selection(
     identity = build_output_identity(
         session, primary, audio, send_mode, media_kind=media_kind
     )
-    cached = await db.get_cached_file(identity)
-    if cached:
+    async def deliver_cached() -> bool:
+        cached = await db.get_cached_file(identity)
+        if not cached:
+            return False
         try:
             await telegram_service.send_cached(
-                chat_id,
-                cached["telegram_file_id"],
-                send_mode,
+                chat_id, cached["telegram_file_id"], send_mode,
                 "Served from the bot's private exact-format cache.",
             )
-            return SelectionResult("cache")
+            return True
         except Exception:
             await db.invalidate_cached_file(identity)
+            return False
 
-    active = await db.find_active_job_by_identity(identity)
-    if active:
-        subscriber_id = await db.add_job_subscriber(
-            active.job_id,
-            user_id,
-            chat_id,
-            message_id,
-            send_mode,
-            app_settings.max_queued_jobs_per_user,
-        )
-        return SelectionResult("coalesced", job=active, subscriber_id=subscriber_id)
-    try:
-        job = await db.create_download_job(
-            session=session,
-            video_format=primary,
-            audio_format=audio,
-            chat_id=chat_id,
-            message_id=message_id,
-            send_mode=send_mode,
-            media_kind=media_kind,
-            output_identity=identity,
-            max_queued_jobs_per_user=app_settings.max_queued_jobs_per_user,
-            max_total_queued_jobs=app_settings.max_total_queued_jobs,
-        )
-    except aiosqlite.IntegrityError:
+    # The partial unique job index, transactional subscriber admission and
+    # atomic upload finalizer may race in either safe direction. Retry only a
+    # small fixed number of times so a terminal job can become cache/new work.
+    for _ in range(3):
+        if await deliver_cached():
+            return SelectionResult("cache")
         active = await db.find_active_job_by_identity(identity)
-        if not active:
-            raise
-        subscriber_id = await db.add_job_subscriber(
-            active.job_id,
-            user_id,
-            chat_id,
-            message_id,
-            send_mode,
-            app_settings.max_queued_jobs_per_user,
+        if active:
+            subscriber_id = await db.try_add_job_subscriber(
+                active.job_id, identity, user_id, chat_id, message_id, send_mode,
+                app_settings.max_queued_jobs_per_user,
+            )
+            if subscriber_id:
+                return SelectionResult(
+                    "coalesced", job=active, subscriber_id=subscriber_id
+                )
+            continue
+        try:
+            job = await db.create_download_job(
+                session=session,
+                video_format=primary,
+                audio_format=audio,
+                chat_id=chat_id,
+                message_id=message_id,
+                send_mode=send_mode,
+                media_kind=media_kind,
+                output_identity=identity,
+                max_queued_jobs_per_user=app_settings.max_queued_jobs_per_user,
+                max_total_queued_jobs=app_settings.max_total_queued_jobs,
+            )
+        except aiosqlite.IntegrityError:
+            continue
+        scheduler.wake()
+        recipient = await db.get_waiting_subscriber(
+            job.job_id, user_id, chat_id, message_id
         )
-        return SelectionResult("coalesced", job=active, subscriber_id=subscriber_id)
-    scheduler.wake()
-    recipient = await db.get_waiting_subscriber(
-        job.job_id, user_id, chat_id, message_id
-    )
-    return SelectionResult(
-        "queued", job=job,
-        subscriber_id=recipient["subscriber_id"] if recipient else None,
-    )
+        return SelectionResult(
+            "queued", job=job,
+            subscriber_id=recipient["subscriber_id"] if recipient else None,
+        )
+    if await deliver_cached():
+        return SelectionResult("cache")
+    raise QueueLimitError("The active download changed. Please try this selection again.")

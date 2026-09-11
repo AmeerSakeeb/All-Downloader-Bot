@@ -13,11 +13,13 @@ class Extractor(Protocol):
         ...
 
     async def extract(
-        self, url: str, user_id: int, *, operation_id: str | None = None
+        self, url: str, user_id: int, *, operation_id: str | None = None,
+        prefer_impersonation: bool = False,
     ) -> MediaSession:
         """
         Extract metadata and available formats for the given URL.
         operation_id identifies the process owner for cancellable extraction.
+        prefer_impersonation reuses a transport profile selected during analysis.
         Raises ExtractionError or its subclasses on failure.
         """
         ...

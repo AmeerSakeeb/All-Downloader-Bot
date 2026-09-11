@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 import uuid
 from typing import Any
+from urllib.parse import urlsplit
 
 from core.config import Settings, get_settings
 from core.exceptions import (
-    AuthenticationRequiredError, DRMProtectedError, ExtractionError, UnsupportedUrlError,
+    AuthenticationRequiredError, DRMProtectedError, ExtractionError,
+    ExtractionTimeoutError, SiteAccessChallengeError, UnsupportedUrlError,
 )
 from core.models import MediaAsset, MediaItem, MediaSession
 from downloads.process_supervisor import ProcessSupervisor
@@ -17,6 +21,10 @@ from extractors.format_manager import normalize_format_inventory
 from extractors.interface import Extractor
 from security.proxy import ControlledOutboundProxy
 from security.ssrf import SSRFGuard
+from security.url_logging import sanitize_url_for_log
+from services.ytdlp_policy import CookieFileUnavailableError, YtDlpPolicy
+
+logger = logging.getLogger(__name__)
 
 
 class YtDlpExtractor(Extractor):
@@ -37,7 +45,8 @@ class YtDlpExtractor(Extractor):
         return True
 
     async def extract(
-        self, url: str, user_id: int, *, operation_id: str | None = None
+        self, url: str, user_id: int, *, operation_id: str | None = None,
+        prefer_impersonation: bool = False,
     ) -> MediaSession:
         settings = self.settings or get_settings()
         timeout_secs = self.timeout_secs or settings.ytdlp_timeout
@@ -47,48 +56,109 @@ class YtDlpExtractor(Extractor):
         if not proxy_url:
             temporary_proxy = ControlledOutboundProxy()
             proxy_url = await temporary_proxy.start()
-        command = [
-            "yt-dlp",
-            "--dump-single-json",
-            "--playlist-end",
-            str(settings.max_collection_items),
-            "--no-warnings",
-            "--ignore-config",
-            "--no-cookies",
-            "--proxy",
-            proxy_url,
-            url,
-        ]
         try:
             process_owner = operation_id or f"extraction-{uuid.uuid4().hex}"
-            result = await self.supervisor.run(
-                command,
-                job_id=process_owner,
-                stage="extraction",
-                timeout=timeout_secs,
-                max_output_bytes=8 * 1024 * 1024,
-            )
+            policy = YtDlpPolicy(settings, proxy_url)
+            attempts = [True] if prefer_impersonation else [False]
+            if settings.ytdlp_impersonation_fallback and not prefer_impersonation:
+                attempts.append(True)
+            for attempt_index, impersonated in enumerate(attempts):
+                attempt_type = self._attempt_type(policy.authenticated, impersonated)
+                try:
+                    command = self._build_command(
+                        url, settings, policy, impersonated=impersonated
+                    )
+                except CookieFileUnavailableError as error:
+                    logger.error(
+                        "yt-dlp extraction configuration failure site=%s attempt=%s category=cookie_file_unavailable",
+                        urlsplit(url).hostname or "unknown", attempt_type,
+                    )
+                    raise ExtractionError(
+                        "The configured cookie file is unavailable",
+                        user_message="The operator-managed authorized session is unavailable.",
+                    ) from error
+                try:
+                    result = await self.supervisor.run(
+                        command,
+                        job_id=process_owner,
+                        stage="extraction",
+                        timeout=timeout_secs,
+                        max_output_bytes=8 * 1024 * 1024,
+                    )
+                except asyncio.TimeoutError as error:
+                    self._log_attempt(
+                        url, attempt_type, returncode=None, timed_out=True,
+                        diagnostic="", category="extraction_timeout",
+                    )
+                    if attempt_index + 1 < len(attempts):
+                        continue
+                    raise ExtractionTimeoutError() from error
+                if result.returncode == 0:
+                    try:
+                        metadata = json.loads(result.stdout.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                        self._log_attempt(
+                            url, attempt_type, returncode=result.returncode,
+                            timed_out=False, diagnostic="malformed metadata",
+                            category="extraction_failed",
+                        )
+                        raise ExtractionError("yt-dlp returned malformed metadata") from error
+                    self._log_attempt(
+                        url, attempt_type, returncode=0, timed_out=False,
+                        diagnostic="", category="success",
+                    )
+                    return self._build_session(
+                        metadata, url, user_id, settings,
+                        impersonated=impersonated,
+                    )
+                diagnostic = result.stderr.decode("utf-8", errors="replace")[-4000:]
+                category = self._classify_failure(diagnostic)
+                self._log_attempt(
+                    url, attempt_type, returncode=result.returncode,
+                    timed_out=False, diagnostic=self._safe_diagnostic(
+                        diagnostic, settings.ytdlp_cookies_file
+                    ), category=category,
+                )
+                if category == "authentication_required":
+                    raise AuthenticationRequiredError()
+                if category == "unsupported_url":
+                    raise UnsupportedUrlError(sanitize_url_for_log(url))
+                if category == "drm_unsupported":
+                    raise DRMProtectedError(sanitize_url_for_log(url))
+                if category == "site_access_challenge":
+                    if attempt_index + 1 < len(attempts):
+                        continue
+                    raise SiteAccessChallengeError()
+                raise ExtractionError(
+                    "yt-dlp could not analyze this media URL",
+                    user_message="The website could not be analyzed safely. Please try again later.",
+                )
         except FileNotFoundError as error:
             raise ExtractionError("yt-dlp is not installed") from error
-        except asyncio.TimeoutError as error:
-            raise ExtractionError("Media analysis timed out") from error
         finally:
             if temporary_proxy:
                 await temporary_proxy.close()
-        if result.returncode != 0:
-            diagnostic = result.stderr.decode("utf-8", errors="replace")[-2000:]
-            lowered = diagnostic.lower()
-            if "unsupported url" in lowered:
-                raise UnsupportedUrlError(url)
-            if "drm" in lowered or "decrypt" in lowered:
-                raise DRMProtectedError(url)
-            if any(value in lowered for value in ("sign in", "log in", "login required", "cookies")):
-                raise AuthenticationRequiredError()
-            raise ExtractionError("yt-dlp could not analyze this public media URL")
-        try:
-            metadata = json.loads(result.stdout.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ExtractionError("yt-dlp returned malformed metadata") from error
+
+    @staticmethod
+    def _build_command(
+        url: str, settings: Settings, policy: YtDlpPolicy, *, impersonated: bool
+    ) -> list[str]:
+        return [
+            "yt-dlp",
+            "--dump-single-json",
+            "--skip-download",
+            "--no-check-formats",
+            "--playlist-end",
+            str(settings.max_collection_items),
+            "--no-warnings",
+            *policy.common_args(impersonate=impersonated),
+            url,
+        ]
+
+    def _build_session(
+        self, metadata: dict[str, Any], url: str, user_id: int,
+        settings: Settings, *, impersonated: bool,
+    ) -> MediaSession:
         self._validate_extracted_urls(metadata)
         raw_formats = metadata.get("formats") or ([metadata] if metadata.get("url") else [])
         formats = normalize_format_inventory(raw_formats)
@@ -122,6 +192,69 @@ class YtDlpExtractor(Extractor):
             subtitles=subtitles,
             items=items,
             formats=formats,
+            ytdlp_impersonated=impersonated,
+        )
+
+    @staticmethod
+    def _attempt_type(authenticated: bool, impersonated: bool) -> str:
+        if authenticated and impersonated:
+            return "authenticated-impersonated"
+        if authenticated:
+            return "authenticated"
+        return "impersonated" if impersonated else "normal"
+
+    @staticmethod
+    def _classify_failure(diagnostic: str) -> str:
+        lowered = diagnostic.lower()
+        if any(value in lowered for value in (
+            "sign in to confirm", "login required", "log in to", "cookies-from-browser",
+            "use --cookies", "authentication required",
+        )):
+            return "authentication_required"
+        if "unsupported url" in lowered or "no suitable extractor" in lowered:
+            return "unsupported_url"
+        if any(value in lowered for value in (
+            "drm protected", "drm-protected", "digital rights management",
+            "this video is drm",
+        )):
+            return "drm_unsupported"
+        if any(value in lowered for value in (
+            "http error 403", "http error 429", "forbidden", "too many requests",
+            "impersonat", "tls", "ssl", "handshake", "certificate verify",
+            "access denied", "request blocked", "anti-bot", "captcha", "not a bot",
+        )):
+            return "site_access_challenge"
+        return "extraction_failed"
+
+    @staticmethod
+    def _safe_diagnostic(value: str, cookie_file) -> str:
+        lines: list[str] = []
+        cookie_text = str(cookie_file) if cookie_file else ""
+        for line in value.splitlines()[-5:]:
+            lowered = line.lower()
+            if "authorization:" in lowered or "cookie:" in lowered:
+                lines.append("<sensitive diagnostic redacted>")
+                continue
+            if cookie_text:
+                line = line.replace(cookie_text, "<cookie-file>")
+            line = re.sub(
+                r"https?://[^\s]+",
+                lambda match: sanitize_url_for_log(match.group(0).rstrip(".,;)]")),
+                line,
+            )
+            lines.append(line[:500])
+        return " | ".join(lines)
+
+    @staticmethod
+    def _log_attempt(
+        url: str, attempt_type: str, *, returncode: int | None,
+        timed_out: bool, diagnostic: str, category: str,
+    ) -> None:
+        logger.info(
+            "yt-dlp extraction attempt site=%s attempt=%s returncode=%s timeout=%s category=%s diagnostic=%s",
+            urlsplit(url).hostname or "unknown", attempt_type,
+            returncode if returncode is not None else "none", timed_out,
+            category, diagnostic or "none",
         )
 
     @staticmethod

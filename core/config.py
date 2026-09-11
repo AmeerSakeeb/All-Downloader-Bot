@@ -2,7 +2,7 @@
 
 from enum import Enum
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -69,9 +69,28 @@ class Settings(BaseSettings):
 
     # Extraction Configuration
     ytdlp_timeout: int = Field(default=60, ge=10)
+    ytdlp_socket_timeout: int = Field(default=15, ge=3, le=120)
+    ytdlp_extractor_retries: int = Field(default=2, ge=0, le=10)
+    ytdlp_impersonation_fallback: bool = Field(default=True)
+    ytdlp_impersonate_target: str = Field(default="chrome", min_length=1, max_length=40)
+    ytdlp_cookies_file: Optional[Path] = Field(default=None)
     media_session_ttl: int = Field(default=1800, ge=60)
     max_collection_items: int = Field(default=50, ge=1, le=200)
     max_batch_urls: int = Field(default=10, ge=1, le=25)
+
+    @field_validator("ytdlp_cookies_file", mode="before")
+    @classmethod
+    def parse_optional_cookie_path(cls, value):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        return value
+
+    @field_validator("ytdlp_impersonate_target")
+    @classmethod
+    def validate_impersonate_target(cls, value: str) -> str:
+        if not all(character.isalnum() or character in {"-", "_"} for character in value):
+            raise ValueError("YTDLP_IMPERSONATE_TARGET contains unsupported characters")
+        return value
 
     # Download Configuration
     download_timeout: int = Field(default=3600, ge=60)

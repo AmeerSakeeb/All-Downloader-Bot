@@ -15,7 +15,7 @@ from core.models import (
     MediaFormat, MediaSession, UserSettings,
 )
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 ACTIVE_STATUSES = tuple(
     status.value
     for status in (
@@ -90,6 +90,7 @@ class Database:
             4: self._migration_v4,
             5: self._migration_v5,
             6: self._migration_v6,
+            7: self._migration_v7,
         }
         for version in range(current + 1, CURRENT_SCHEMA_VERSION + 1):
             await db.execute("BEGIN IMMEDIATE")
@@ -382,6 +383,18 @@ class Database:
                WHERE status='waiting'"""
         )
 
+    async def _migration_v7(self) -> None:
+        columns = {
+            row["name"]
+            for row in await (
+                await self.connection.execute("PRAGMA table_info(download_jobs)")
+            ).fetchall()
+        }
+        if "ytdlp_impersonated" not in columns:
+            await self.connection.execute(
+                "ALTER TABLE download_jobs ADD COLUMN ytdlp_impersonated INTEGER NOT NULL DEFAULT 0"
+            )
+
     async def schema_version(self) -> int:
         row = await (
             await self.connection.execute(
@@ -435,6 +448,7 @@ class Database:
                 "description", "upload_date", "media_id", "session_kind",
                 "collection_truncated", "thumbnails", "subtitles", "items",
                 "parent_collection_url", "collection_entry_index", "collection_entry_id",
+                "ytdlp_impersonated",
             },
         )
         await self.connection.execute(
@@ -530,6 +544,7 @@ class Database:
             "title": session.title,
             "collection_entry_index": session.collection_entry_index,
             "collection_entry_id": session.collection_entry_id,
+            "ytdlp_impersonated": session.ytdlp_impersonated,
         }
         job = DownloadJob(
             media_session_id=session.session_id,
@@ -548,6 +563,7 @@ class Database:
             output_identity=output_identity,
             collection_entry_index=session.collection_entry_index,
             collection_entry_id=session.collection_entry_id,
+            ytdlp_impersonated=session.ytdlp_impersonated,
         )
         # A separate connection isolates this short transaction from concurrent
         # progress/reservation writes on the application's main connection.
@@ -609,8 +625,9 @@ class Database:
                 speed_bytes_sec,eta_seconds,current_stage,process_pid,error_message,
                 error_category,send_mode,output_path,telegram_file_id,snapshot_json,
                 created_at,updated_at,source_url,canonical_url,extractor,claimed_at,
-                media_kind,output_identity,collection_entry_index,collection_entry_id)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                media_kind,output_identity,collection_entry_index,collection_entry_id,
+                ytdlp_impersonated)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             self._job_values(job, snapshot),
         )
 
@@ -625,6 +642,7 @@ class Database:
             "extractor": job.extractor,
             "collection_entry_index": job.collection_entry_index,
             "collection_entry_id": job.collection_entry_id,
+            "ytdlp_impersonated": job.ytdlp_impersonated,
         }
         return (
             job.job_id,
@@ -658,6 +676,7 @@ class Database:
             job.output_identity,
             job.collection_entry_index,
             job.collection_entry_id,
+            int(job.ytdlp_impersonated),
         )
 
     async def save_job(self, job: DownloadJob) -> None:
@@ -670,6 +689,7 @@ class Database:
             "extractor": job.extractor,
             "collection_entry_index": job.collection_entry_index,
             "collection_entry_id": job.collection_entry_id,
+            "ytdlp_impersonated": job.ytdlp_impersonated,
         }
         await self.connection.execute(
             """UPDATE download_jobs SET message_id=?,status=?,progress_pct=?,
@@ -677,7 +697,7 @@ class Database:
                current_stage=?,process_pid=?,error_message=?,error_category=?,send_mode=?,
                output_path=?,telegram_file_id=?,snapshot_json=?,updated_at=?,source_url=?,
                canonical_url=?,extractor=?,claimed_at=?,media_kind=?,output_identity=?,
-               collection_entry_index=?,collection_entry_id=?
+               collection_entry_index=?,collection_entry_id=?,ytdlp_impersonated=?
                WHERE job_id=? AND (status<>? OR ?=?)""",
             (
                 job.message_id,
@@ -704,6 +724,7 @@ class Database:
                 job.output_identity,
                 job.collection_entry_index,
                 job.collection_entry_id,
+                int(job.ytdlp_impersonated),
                 job.job_id,
                 JobStatus.CANCELLED.value,
                 job.status.value,
@@ -1212,11 +1233,14 @@ class Database:
         finally:
             await db.close()
 
-    async def list_job_subscribers(self, job_id: str) -> list[dict[str, Any]]:
+    async def list_job_subscribers(
+        self, job_id: str, statuses: tuple[str, ...] = ("waiting",)
+    ) -> list[dict[str, Any]]:
+        marks = ",".join("?" for _ in statuses)
         rows = await (
             await self.connection.execute(
-                "SELECT * FROM job_subscribers WHERE job_id=? AND status='waiting' ORDER BY created_at",
-                (job_id,),
+                f"SELECT * FROM job_subscribers WHERE job_id=? AND status IN ({marks}) ORDER BY created_at",
+                (job_id, *statuses),
             )
         ).fetchall()
         return [dict(row) for row in rows]

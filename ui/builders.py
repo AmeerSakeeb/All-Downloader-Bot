@@ -140,6 +140,9 @@ def build_progress_text(job: DownloadJob) -> str:
             "exact_format_disappeared": "🎞 Exact format no longer available",
             "lossless_merge_unavailable": "🎞 Lossless merge unavailable",
             "delivery_size_exceeded": "📦 Telegram delivery limit exceeded",
+            "telegram_delivery_failed": "❌ Telegram delivery failed",
+            "extraction_timeout": "⏳ Website analysis timed out",
+            "site_access_challenge": "🛡 Website access challenge",
         }
         if job.status == JobStatus.FAILED:
             header = failure_headers.get(job.error_category or "", header)
@@ -482,12 +485,15 @@ def build_favorites_text(rules: list[FavoriteFormatRule]) -> str:
     return "\n".join(lines)
 
 
-def build_favorites_keyboard(rules: list[FavoriteFormatRule]) -> InlineKeyboardMarkup:
+def build_favorites_keyboard(
+    rules: list[FavoriteFormatRule], media_session_id: str | None = None
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for index, rule in enumerate(rules, 1):
         builder.row(InlineKeyboardButton(text=f"✏️ Rule {index}", callback_data=f"fedit:{rule.rule_id}"))
     builder.row(InlineKeyboardButton(text="➕ Add Rule", callback_data="fadd"))
-    builder.row(InlineKeyboardButton(text="🔙 Settings", callback_data="settings"))
+    settings_callback = f"settings:{media_session_id}" if media_session_id else "settings"
+    builder.row(InlineKeyboardButton(text="🔙 Settings", callback_data=settings_callback))
     return builder.as_markup()
 
 

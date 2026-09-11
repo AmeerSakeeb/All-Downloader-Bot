@@ -17,4 +17,6 @@ A private Telegram bot that inventories source formats, lets an authorized user 
 
 Docker: `docker compose up --build`. The base Compose file applies no CPU/RAM locks. To impose administrator-selected limits, combine it with `docker-compose.resources.example.yml`.
 
+Public extraction uses no cookies. If a site legitimately requires the operator's authorized session, mount a Netscape-format yt-dlp cookie file read-only with `docker-compose.cookies.example.yml` and set `YTDLP_COOKIES_HOST_PATH` to its host location. Never commit the file or send it through Telegram. Account/session use is subject to each site's rules and risks; DRM and paywall bypass remain unsupported.
+
 See [configuration](docs/configuration.md), [deployment](docs/deployment.md), and [security](docs/security.md).

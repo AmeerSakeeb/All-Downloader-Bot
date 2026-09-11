@@ -27,7 +27,8 @@ class DirectMediaExtractor(Extractor):
         return suffix in {".mp4", ".mkv", ".webm", ".mp3", ".aac", ".m4a", ".ogg"}
 
     async def extract(
-        self, url: str, user_id: int, *, operation_id: str | None = None
+        self, url: str, user_id: int, *, operation_id: str | None = None,
+        prefer_impersonation: bool = False,
     ) -> MediaSession:
         settings = self.settings or get_settings()
         SSRFGuard.validate_url(url)

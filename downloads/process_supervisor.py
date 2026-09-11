@@ -55,6 +55,7 @@ class ProcessSupervisor:
         stage: str = "process",
         **kwargs,
     ) -> asyncio.subprocess.Process:
+        kwargs.setdefault("stdin", asyncio.subprocess.DEVNULL)
         if os.name == "nt":
             kwargs["creationflags"] = kwargs.get("creationflags", 0) | 0x00000200
         else:
@@ -203,6 +204,7 @@ class ProcessSupervisor:
                     "/T",
                     "/PID",
                     str(pid),
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )

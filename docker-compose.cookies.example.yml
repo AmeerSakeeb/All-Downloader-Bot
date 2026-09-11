@@ -1,0 +1,6 @@
+services:
+  bot:
+    environment:
+      YTDLP_COOKIES_FILE: /run/secrets/yt-dlp-cookies.txt
+    volumes:
+      - ${YTDLP_COOKIES_HOST_PATH:?Set YTDLP_COOKIES_HOST_PATH}:/run/secrets/yt-dlp-cookies.txt:ro

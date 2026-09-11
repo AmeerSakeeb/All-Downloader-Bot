@@ -46,6 +46,29 @@ class ExtractionError(BotError):
     error_category: str = "extraction_failed"
 
 
+class ExtractionTimeoutError(ExtractionError):
+    error_category: str = "extraction_timeout"
+
+    def __init__(self):
+        super().__init__(
+            "All bounded media extraction attempts timed out",
+            user_message="The website did not respond before the media-analysis timeout. Please try again later.",
+        )
+
+
+class SiteAccessChallengeError(ExtractionError):
+    error_category: str = "site_access_challenge"
+
+    def __init__(self):
+        super().__init__(
+            "The source rejected the automated media request",
+            user_message=(
+                "This website rejected the server's automated media request. "
+                "An authorized session or different supported access method may be required."
+            ),
+        )
+
+
 class UnsupportedUrlError(ExtractionError):
     error_category: str = "unsupported_url"
 

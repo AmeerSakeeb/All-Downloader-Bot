@@ -112,9 +112,10 @@ class BotApplication:
         self.bot = self.bot_factory(token=self.settings.bot_token, **bot_kwargs)
         self.telegram_service = TelegramService(self.bot, self.settings)
 
-        async def upload(path: Path, job: DownloadJob) -> None:
+        async def upload(path: Path, job: DownloadJob) -> bool:
             assert self.telegram_service is not None
-            telegram_file_id: Optional[str] = None
+            telegram_file_id: Optional[str] = job.telegram_file_id
+            delivered_any = False
             for subscriber in await self.db.list_job_subscribers(job.job_id):
                 if not await self.db.subscriber_is_waiting(subscriber["subscriber_id"]):
                     continue
@@ -145,15 +146,30 @@ class BotApplication:
                                 job.output_identity, telegram_file_id, subscriber["send_mode"],
                                 path.suffix.lower().lstrip(".") or "bin",
                             )
-                    await self.db.mark_subscriber(subscriber["subscriber_id"], "delivered")
+                except Exception:
+                    logger.warning("Independent recipient delivery failed", exc_info=True)
+                    await self.db.mark_subscriber(subscriber["subscriber_id"], "failed")
                     if subscriber["message_id"]:
+                        try:
+                            await self.bot.edit_message_text(
+                                chat_id=subscriber["chat_id"], message_id=subscriber["message_id"],
+                                text=("❌ <b>Telegram delivery failed</b>\n\n"
+                                      "Telegram could not deliver the completed media. Please try again."),
+                            )
+                        except Exception:
+                            logger.debug("Recipient delivery-failure edit was rejected", exc_info=True)
+                    continue
+                delivered_any = True
+                await self.db.mark_subscriber(subscriber["subscriber_id"], "delivered")
+                if subscriber["message_id"]:
+                    try:
                         await self.bot.edit_message_text(
                             chat_id=subscriber["chat_id"], message_id=subscriber["message_id"],
                             text="✅ <b>Download Complete</b>\n\nOriginal output delivered without re-encoding.",
                         )
-                except Exception:
-                    logger.warning("Independent recipient delivery failed", exc_info=True)
-                    await self.db.mark_subscriber(subscriber["subscriber_id"], "failed")
+                    except Exception:
+                        logger.debug("Recipient completion edit was rejected", exc_info=True)
+            return delivered_any
 
         self.scheduler = JobScheduler(
             self.db,
@@ -207,7 +223,7 @@ class BotApplication:
         if not terminal and now - self._progress_last.get(job.job_id, 0.0) < 2.0:
             return
         self._progress_last[job.job_id] = now
-        if self.db:
+        if self.db and not terminal:
             for recipient in await self.db.list_job_subscribers(job.job_id):
                 if not recipient["message_id"]:
                     continue
@@ -216,7 +232,7 @@ class BotApplication:
                         chat_id=recipient["chat_id"],
                         message_id=recipient["message_id"],
                         text=build_progress_text(job),
-                        reply_markup=None if terminal else InlineKeyboardMarkup(
+                        reply_markup=InlineKeyboardMarkup(
                             inline_keyboard=[[InlineKeyboardButton(
                                 text="❌ Cancel my delivery",
                                 callback_data=f"cancel_sub:{recipient['subscriber_id']}",
@@ -226,18 +242,16 @@ class BotApplication:
                 except Exception:
                     logger.debug("Recipient progress edit was rejected or unchanged", exc_info=True)
         if terminal and self.db and job.status in {JobStatus.FAILED, JobStatus.CANCELLED}:
-            for subscriber in await self.db.list_job_subscribers(job.job_id):
+            recipient_statuses = ("waiting", "failed") if job.status == JobStatus.FAILED else ("waiting",)
+            for subscriber in await self.db.list_job_subscribers(job.job_id, recipient_statuses):
                 status = "cancelled" if job.status == JobStatus.CANCELLED else "failed"
                 await self.db.mark_subscriber(subscriber["subscriber_id"], status)
                 if subscriber["message_id"]:
                     try:
                         await self.bot.edit_message_text(
                             chat_id=subscriber["chat_id"], message_id=subscriber["message_id"],
-                            text=(
-                                "⏹ <b>Shared download cancelled</b>"
-                                if status == "cancelled" else
-                                "❌ <b>Shared download failed</b>\n\nPlease analyze the link and try again."
-                            ),
+                            text=("⏹ <b>Shared download cancelled</b>"
+                                  if status == "cancelled" else build_progress_text(job)),
                         )
                     except Exception:
                         logger.debug("Subscriber terminal edit was rejected", exc_info=True)
