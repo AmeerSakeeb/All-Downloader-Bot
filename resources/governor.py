@@ -134,6 +134,8 @@ class ResourceGovernor:
     async def acquire_stage(self, stage: str) -> tuple[Optional[StageLease], str]:
         if stage not in self._active_counts:
             return None, f"Unknown stage: {stage}"
+        if stage in {"download", "merge"} and self.file_mgr.get_free_disk_space() <= self.disk_safety_bytes():
+            return None, "protected disk headroom is under pressure"
         limits = await self.adaptive_limits()
         pressure_ok, reason = self._pressure_check(self._last_sample)
         if not pressure_ok and self.settings.resource_mode != ResourceMode.MANUAL:
@@ -184,6 +186,8 @@ class ResourceGovernor:
     def _pressure_check(self, sample: Optional[dict[str, object]]) -> tuple[bool, str]:
         if not sample:
             return True, "Ready"
+        if float(sample.get("io_pressure", 0)) >= 10.0:
+            return False, "disk I/O is under pressure"
         memory = sample["memory"]
         cpu = sample["cpu"]
         loads = sample["load_average"]

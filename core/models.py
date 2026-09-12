@@ -205,6 +205,8 @@ class MediaSession(BaseModel):
     collection_entry_index: Optional[int] = None
     collection_entry_id: Optional[str] = None
     ytdlp_impersonated: bool = False
+    cookie_profile: Optional[str] = None
+    collection_depth: int = 0
 
     # Complete format inventory
     formats: List[MediaFormat] = Field(default_factory=list)
@@ -292,3 +294,5 @@ class DownloadJob(BaseModel):
     collection_entry_index: Optional[int] = None
     collection_entry_id: Optional[str] = None
     ytdlp_impersonated: bool = False
+    cookie_profile: Optional[str] = None
+    source_media_id: Optional[str] = None

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
+import hashlib
+import re
 import time
 from collections import deque
 from pathlib import Path
@@ -16,7 +19,9 @@ from core.exceptions import DownloadError, InsufficientDiskSpaceError
 from downloads.process_supervisor import ProcessSupervisor
 from downloads.progress import ProgressTracker
 from services.ytdlp_policy import CookieFileUnavailableError, YtDlpPolicy
+from services.cookie_profiles import CookieProfiles, CookieProfileError
 from storage.file_manager import FileManager
+from security.url_logging import sanitize_diagnostic
 
 ProgressCallback = Callable[
     [float, int, Optional[int], float, Optional[int]], Awaitable[None] | None
@@ -32,6 +37,7 @@ class Downloader:
         supervisor: Optional[ProcessSupervisor] = None,
         proxy_url: Optional[str] = None,
         growth_check: Optional[Callable[[str, int], Awaitable[bool]]] = None,
+        profiles: CookieProfiles | None = None,
     ):
         self.file_mgr = file_mgr
         self.settings = settings or get_settings()
@@ -40,6 +46,7 @@ class Downloader:
         )
         self.proxy_url = proxy_url
         self.growth_check = growth_check
+        self.profiles = profiles
 
     async def download_format(
         self,
@@ -55,6 +62,7 @@ class Downloader:
         raw_http: bool = False,
         playlist_index: Optional[int] = None,
         impersonate: bool = False,
+        cookie_profile: str | None = None,
     ) -> Path:
         output_path = self.file_mgr.get_job_file_path(job_id, output_filename)
         if raw_http:
@@ -65,8 +73,9 @@ class Downloader:
             command = self._build_ytdlp_command(
                 url, format_id, output_path, direct_source,
                 playlist_index=playlist_index, impersonate=impersonate,
+                cookie_profile=cookie_profile,
             )
-        except CookieFileUnavailableError as error:
+        except (CookieFileUnavailableError, CookieProfileError) as error:
             raise DownloadError(
                 "Configured yt-dlp cookie file is unavailable",
                 user_message="The operator-managed authorized session is unavailable.",
@@ -83,7 +92,11 @@ class Downloader:
         except FileNotFoundError as error:
             raise DownloadError("yt-dlp is not installed") from error
         if pid_callback:
-            await self._maybe_await(pid_callback(process.pid))
+            try:
+                await self._maybe_await(pid_callback(process.pid))
+            except BaseException:
+                await self.supervisor.cancel_job(job_id)
+                raise
 
         updates: deque[tuple[float, int, Optional[int], float, Optional[int]]] = deque(maxlen=1)
         tracker = ProgressTracker(lambda *args: updates.append(args)) if on_progress else None
@@ -139,6 +152,7 @@ class Downloader:
                 await self.supervisor.cancel_job(job_id)
                 raise
         finally:
+            await self.supervisor.reap_owned(job_id, stage, process)
             for task in tasks:
                 if not task.done():
                     task.cancel()
@@ -150,7 +164,8 @@ class Downloader:
         if process.returncode != 0:
             diagnostic = b"".join(errors).decode("utf-8", errors="replace")[-2000:]
             raise DownloadError(
-                f"yt-dlp failed with exit {process.returncode}: {self._redact_diagnostic(diagnostic)}"
+                f"yt-dlp failed with exit {process.returncode}: " +
+                ("<session diagnostic redacted>" if cookie_profile else self._redact_diagnostic(diagnostic))
             )
         actual_path = self._find_downloaded_file(output_path)
         if not actual_path:
@@ -160,9 +175,10 @@ class Downloader:
     def _build_ytdlp_command(
         self, url: str, format_id: str, output_path: Path, direct_source: bool,
         *, playlist_index: Optional[int] = None, impersonate: bool = False,
+        cookie_profile: str | None = None,
     ) -> list[str]:
         command = [
-            "yt-dlp",
+            *YtDlpPolicy.executable(),
             "-o",
             str(output_path),
             "--no-warnings",
@@ -171,8 +187,8 @@ class Downloader:
             "download:__AVDB_PROGRESS__|%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s",
         ]
         command.extend(
-            YtDlpPolicy(self.settings, self.proxy_url).common_args(
-                impersonate=impersonate
+            YtDlpPolicy(self.settings, self.proxy_url, getattr(self, "profiles", None)).common_args(
+                impersonate=impersonate, url=url, profile_name=cookie_profile,
             )
         )
         if playlist_index is None:
@@ -180,13 +196,9 @@ class Downloader:
         else:
             command.extend(("--playlist-items", str(playlist_index)))
         if not direct_source:
-            command[1:1] = ["-f", format_id]
+            command.extend(("-f", format_id))
         if self.settings.resume_enabled:
             command.append("--continue")
-        if self.settings.max_retries > 0:
-            command.extend(("--retries", str(self.settings.max_retries), "--fragment-retries", str(self.settings.max_retries)))
-        if self.settings.bandwidth_ceiling > 0:
-            command.extend(("--limit-rate", str(self.settings.bandwidth_ceiling)))
         command.append(url)
         return command
 
@@ -194,20 +206,53 @@ class Downloader:
         self, job_id: str, url: str, output_path: Path,
         expected_size: Optional[int], on_progress: Optional[ProgressCallback],
     ) -> Path:
+        for attempt in range(self.settings.max_retries + 1):
+            try:
+                return await self._download_http_once(job_id, url, output_path, expected_size, on_progress)
+            except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError):
+                if attempt >= self.settings.max_retries:
+                    raise DownloadError("The source download was interrupted", user_message="The source connection failed. Please try again later.") from None
+                await asyncio.sleep(min(attempt + 1, 3))
+        raise DownloadError("Download retry budget exhausted")
+
+    async def _download_http_once(
+        self, job_id: str, url: str, output_path: Path,
+        expected_size: Optional[int], on_progress: Optional[ProgressCallback],
+    ) -> Path:
         """Stream an exact auxiliary source asset through the controlled proxy."""
-        part = output_path.with_suffix(output_path.suffix + ".part")
+        part = self.file_mgr.get_job_file_path(job_id, output_path.name + ".part")
+        state_path = self.file_mgr.get_job_file_path(job_id, output_path.name + ".resume.json")
+        source_key = hashlib.sha256(url.encode()).hexdigest()
+        state = {}
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
         offset = part.stat().st_size if self.settings.resume_enabled and part.exists() else 0
-        headers = {"Range": f"bytes={offset}-"} if offset else {}
+        validator = state.get("validator") if isinstance(state, dict) and state.get("source") == source_key else None
+        if not validator:
+            offset = 0
+        headers = {"Range": f"bytes={offset}-", "If-Range": validator} if offset else {}
+        headers["Accept-Encoding"] = "identity"
         timeout = aiohttp.ClientTimeout(total=self.settings.download_timeout)
         started = time.monotonic()
         downloaded = offset
-        async with aiohttp.ClientSession(timeout=timeout) as client:
+        async with aiohttp.ClientSession(timeout=timeout, auto_decompress=False) as client:
             async with client.get(url, headers=headers, proxy=self.proxy_url) as response:
                 if response.status >= 400:
                     raise DownloadError(f"Direct source returned HTTP {response.status}")
                 append = offset > 0 and response.status == 206
+                if response.status == 206:
+                    matched = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+|\*)", response.headers.get("Content-Range", ""))
+                    if not matched or int(matched[1]) != offset:
+                        raise DownloadError("Source returned an inconsistent byte range")
                 if not append:
                     offset = downloaded = 0
+                etag = response.headers.get("ETag")
+                next_validator = etag if etag and not etag.startswith("W/") else response.headers.get("Last-Modified")
+                if append and next_validator != validator:
+                    raise DownloadError("Source changed while resuming the original asset")
+                state_path.write_text(json.dumps({"source": source_key, "validator": next_validator}), encoding="utf-8")
                 length = response.headers.get("Content-Length")
                 total = offset + int(length) if length and length.isdigit() else expected_size
                 with part.open("ab" if append else "wb") as destination:
@@ -230,7 +275,10 @@ class Downloader:
                                 pct, downloaded, total, (downloaded - offset) / elapsed,
                                 int((total - downloaded) / max(1, (downloaded - offset) / elapsed)) if total else None,
                             ))
+                if total is not None and downloaded != total:
+                    raise DownloadError("Source ended before the complete byte range was received")
         part.replace(output_path)
+        state_path.unlink(missing_ok=True)
         return output_path
 
     @staticmethod
@@ -244,7 +292,7 @@ class Downloader:
         for line in value.splitlines()[-20:]:
             words = ["<url-redacted>" if word.startswith(("http://", "https://")) else word for word in line.split()]
             lines.append(" ".join(words))
-        return "\n".join(lines)
+        return sanitize_diagnostic("\n".join(lines))
 
     @staticmethod
     def _find_downloaded_file(expected: Path) -> Optional[Path]:

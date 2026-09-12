@@ -66,6 +66,7 @@ class JobScheduler:
         self._running: dict[str, asyncio.Task[None]] = {}
         self._accepting = False
         self._paused = False
+        self._last_user_id: int | None = None
 
     @property
     def running_job_ids(self) -> set[str]:
@@ -171,13 +172,23 @@ class JobScheduler:
         if slots <= 0:
             return 0
         dispatched = 0
-        for job in await self.db.list_queued_jobs(limit=slots):
+        pending = await self.db.list_queued_jobs(limit=self.settings.max_total_queued_jobs)
+        ranks: dict[str, int] = {}
+        user_counts: dict[int, int] = {}
+        for candidate in pending:
+            ranks[candidate.job_id] = user_counts.get(candidate.user_id, 0)
+            user_counts[candidate.user_id] = ranks[candidate.job_id] + 1
+        pending.sort(key=lambda job: (ranks[job.job_id], job.user_id == self._last_user_id))
+        for job in pending:
+            if dispatched >= slots:
+                break
             if job.job_id in self._running or not await self.db.claim_job(job.job_id):
                 continue
             task = asyncio.create_task(
                 self.execute_job(job.job_id), name=f"download-job-{job.job_id}"
             )
             self._running[job.job_id] = task
+            self._last_user_id = job.user_id
             dispatched += 1
         return dispatched
 
@@ -388,6 +399,7 @@ class JobScheduler:
                     if job.collection_entry_index is not None else {}
                 ),
                 **({"impersonate": True} if job.ytdlp_impersonated else {}),
+                **({"cookie_profile": job.cookie_profile} if job.cookie_profile else {}),
             )
         if not audio:
             return video_path
@@ -410,6 +422,7 @@ class JobScheduler:
                     if job.collection_entry_index is not None else {}
                 ),
                 **({"impersonate": True} if job.ytdlp_impersonated else {}),
+                **({"cookie_profile": job.cookie_profile} if job.cookie_profile else {}),
             )
         return video_path
 
@@ -447,9 +460,16 @@ class JobScheduler:
                         {"prefer_impersonation": True}
                         if job.ytdlp_impersonated else {}
                     ),
+                    **({"cookie_profile": job.cookie_profile} if job.cookie_profile else {}),
                 )
+            job.ytdlp_impersonated = refreshed.ytdlp_impersonated
+            job.cookie_profile = refreshed.cookie_profile
+            if job.collection_entry_index is None and job.source_media_id and refreshed.media_id != job.source_media_id:
+                raise ExactFormatUnavailableError()
             inventory = refreshed.formats
             if job.collection_entry_index is not None:
+                if not job.collection_entry_id:
+                    raise ExactFormatUnavailableError()
                 selected_item = next(
                     (
                         item for item in refreshed.items
@@ -494,6 +514,7 @@ class JobScheduler:
             "is_video",
             "is_audio",
             "is_muxed",
+            "requires_separate_audio", "audio_language", "audio_is_default", "audio_is_original",
         )
         if any(getattr(expected, key) != getattr(current, key) for key in keys):
             raise ExactFormatUnavailableError()

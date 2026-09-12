@@ -142,5 +142,18 @@ class ResourceDetector:
                 "cpu": cls.get_cpu_info(),
                 "load_average": cls.get_load_average(),
                 "process": cls.get_process_pressure(),
+                "io_pressure": cls.get_io_pressure(),
             }
         )
+
+    @staticmethod
+    def get_io_pressure() -> float:
+        """Linux PSI full-stall percentage over ten seconds, zero when unavailable."""
+        value = read_cgroup_file(Path("/proc/pressure/io")) or ""
+        for line in value.splitlines():
+            if line.startswith("full "):
+                try:
+                    return float(dict(part.split("=", 1) for part in line.split()[1:])["avg10"])
+                except (ValueError, KeyError):
+                    return 0.0
+        return 0.0

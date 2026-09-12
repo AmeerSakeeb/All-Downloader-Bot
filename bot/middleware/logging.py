@@ -1,6 +1,7 @@
 """Middleware for logging user interactions and callback requests."""
 
 import logging
+import asyncio
 import time
 from typing import Any, Awaitable, Callable, Dict
 from aiogram import BaseMiddleware
@@ -11,6 +12,9 @@ logger = logging.getLogger(__name__)
 
 class LoggingMiddleware(BaseMiddleware):
     """Logs simple metrics about incoming commands, URLs, and callbacks."""
+
+    def __init__(self, tasks=None):
+        self.tasks = tasks if tasks is not None else set()
 
     async def __call__(
         self,
@@ -25,13 +29,16 @@ class LoggingMiddleware(BaseMiddleware):
 
         if isinstance(event, Message):
             user_id = str(event.from_user.id) if event.from_user else "unknown"
-            detail = f"text: {event.text[:50]}" if event.text else "media"
+            detail = "text" if event.text else "media"
         elif isinstance(event, CallbackQuery):
             user_id = str(event.from_user.id) if event.from_user else "unknown"
-            detail = f"callback_data: {event.data}"
+            detail = "callback"
 
         logger.info(f"Incoming update from user {user_id} | Type: {update_type} | Details: {detail}")
 
+        task = asyncio.current_task()
+        if task:
+            self.tasks.add(task)
         try:
             result = await handler(event, data)
             elapsed = time.time() - start_time
@@ -41,3 +48,5 @@ class LoggingMiddleware(BaseMiddleware):
             elapsed = time.time() - start_time
             logger.error(f"Error handling update from user {user_id} after {elapsed:.3f}s: {e}", exc_info=True)
             raise
+        finally:
+            self.tasks.discard(task)

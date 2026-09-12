@@ -6,6 +6,7 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
+from security.url_logging import sanitize_diagnostic
 
 # Sensitive patterns to sanitize
 _SENSITIVE_PATTERNS = [
@@ -27,7 +28,7 @@ class SanitizingFormatter(logging.Formatter):
         msg = super().format(record)
         for pattern in _SENSITIVE_PATTERNS:
             msg = pattern.sub(r"\1=***REDACTED***", msg) if r"\1" in pattern.pattern else pattern.sub("***REDACTED***", msg)
-        return msg
+        return sanitize_diagnostic(msg)
 
 
 def setup_logging(

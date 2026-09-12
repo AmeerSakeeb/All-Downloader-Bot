@@ -37,6 +37,11 @@ async def submit_exact_selection(
 ) -> SelectionResult:
     if session.user_id != user_id or session.is_expired():
         raise ValueError("Media session is stale or not owned by this user")
+    user = await db.get_user(user_id)
+    if not user or not user["is_allowed"]:
+        raise QueueLimitError("Your access to this bot has been revoked.")
+    if scheduler.paused:
+        raise QueueLimitError("New downloads are paused by the administrator. Please try later.")
     preferences = await db.get_user_settings(user_id)
     send_mode = preferences.send_mode if media_kind == "video" else "document"
     if media_kind == "video" and primary.requires_separate_audio and audio is None:

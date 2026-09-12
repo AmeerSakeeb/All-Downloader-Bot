@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 from core.models import JobStatus
+from core.models import MediaFormat
 from downloads.process_supervisor import ProcessSupervisor
 from storage.database import Database
 from storage.file_manager import FileManager
@@ -58,9 +59,30 @@ class QueueManager:
         for job in await self.db.get_active_jobs():
             job.process_pid = None
             job.claimed_at = None
-            job.status = JobStatus.QUEUED
-            job.current_stage = "Recovered after restart"
+            try:
+                self.file_mgr.validate_recovery_dir(job.job_id)
+                if not job.source_url or not job.video_format_snapshot:
+                    raise ValueError("Missing durable execution snapshot")
+                MediaFormat.model_validate(job.video_format_snapshot)
+                if job.audio_format_id:
+                    MediaFormat.model_validate(job.audio_format_snapshot)
+                recipients = await self.db.list_job_subscribers(job.job_id, ("waiting", "delivered", "failed", "cancelled"))
+                if recipients and not any(r["status"] == "waiting" for r in recipients):
+                    job.status = JobStatus.COMPLETED if any(r["status"] == "delivered" for r in recipients) else JobStatus.CANCELLED
+                    job.current_stage = "Recovered recipient outcome"
+                else:
+                    job.status = JobStatus.QUEUED
+                    job.current_stage = "Recovered after restart"
+            except Exception:
+                job.status = JobStatus.FAILED
+                job.current_stage = "Recovery unavailable"
+                job.error_category = "download_failed"
+                job.error_message = "The interrupted download cannot be resumed safely. Send the link again."
             await self.db.save_job(job)
+            await self.db.release_disk_reservation(job.job_id)
+        await self.db.connection.execute(
+            "DELETE FROM disk_reservations WHERE job_id NOT IN (SELECT job_id FROM download_jobs WHERE status='queued')"
+        )
 
     async def prepare_shutdown(self) -> None:
         """Stop owned processes and leave unfinished jobs deterministically recoverable."""

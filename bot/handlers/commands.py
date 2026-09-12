@@ -25,7 +25,9 @@ async def cmd_start(message: Message):
         "👋 <b>Welcome to the Media Downloader Bot!</b>\n\n"
         "This is a private, resource-efficient video downloader bot. "
         "You are authorized to use this service.\n\n"
-        "Send a public media URL to get started.\n\n"
+        "Paste a supported media URL, then choose Favorite Formats, Browse All Formats, or Audio Only.\n\n"
+        "Playlists and multimedia posts have individual item selection. Use /settings for send mode and format preferences. "
+        "Original streams are preserved without compression or transcoding.\n\n"
         "Use /help for the usage and codec guide."
     )
     await message.reply(text)
@@ -36,15 +38,18 @@ async def cmd_help(message: Message):
     """Usage help and codec information."""
     text = (
         "📖 <b>Usage guide</b>\n"
-        "1. Send a public video link.\n"
-        "2. Choose an exact source format.\n"
+        "1. Paste a supported media link (or a small batch of links).\n"
+        "2. Choose Favorite Formats, Browse All Formats, or original Audio Only.\n"
         "3. The bot downloads and, when needed, combines original streams without re-encoding.\n\n"
         "⚙️ <b>Codec guide</b>\n"
         "• H.264 / AVC: broadly compatible.\n"
         "• H.265 / HEVC: efficient, with newer-player support.\n"
         "• VP9 and AV1: efficient modern codecs.\n\n"
-        "🔒 <b>DRM notice</b>\n"
-        "DRM-protected, paywalled, authenticated, and private media are not supported."
+        "⚙️ /settings controls send mode, Favorite rules and automatic/manual audio. "
+        "Playlists and multimedia posts offer item selection; subtitles and thumbnails remain optional original files.\n\n"
+        "Supports many public non-DRM sites through yt-dlp and direct media handling. "
+        "Some sites require an operator-configured authorized session. "
+        "DRM, paywall and access-control bypass are unsupported; website behavior can change."
     )
     await message.reply(text)
 

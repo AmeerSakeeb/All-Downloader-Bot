@@ -3,7 +3,8 @@
 from enum import Enum
 from pathlib import Path
 from typing import List, Optional
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
+from urllib.parse import urlsplit
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -74,11 +75,20 @@ class Settings(BaseSettings):
     ytdlp_impersonation_fallback: bool = Field(default=True)
     ytdlp_impersonate_target: str = Field(default="chrome", min_length=1, max_length=40)
     ytdlp_cookies_file: Optional[Path] = Field(default=None)
+    ytdlp_cookie_domains: List[str] = Field(default_factory=list)
+    ytdlp_profiles_file: Optional[Path] = Field(default=None)
+    max_collection_depth: int = Field(default=3, ge=1, le=8)
+    maintenance_interval_seconds: int = Field(default=900, ge=60)
+    orphan_grace_hours: int = Field(default=24, ge=1)
+    job_history_days: int = Field(default=30, ge=1)
+    cache_retention_days: int = Field(default=90, ge=1)
+    ui_draft_ttl_hours: int = Field(default=24, ge=1)
+    backup_retention_count: int = Field(default=5, ge=1, le=50)
     media_session_ttl: int = Field(default=1800, ge=60)
     max_collection_items: int = Field(default=50, ge=1, le=200)
     max_batch_urls: int = Field(default=10, ge=1, le=25)
 
-    @field_validator("ytdlp_cookies_file", mode="before")
+    @field_validator("ytdlp_cookies_file", "ytdlp_profiles_file", mode="before")
     @classmethod
     def parse_optional_cookie_path(cls, value):
         if value is None or (isinstance(value, str) and not value.strip()):
@@ -94,29 +104,46 @@ class Settings(BaseSettings):
 
     # Download Configuration
     download_timeout: int = Field(default=3600, ge=60)
-    max_retries: int = Field(default=3, ge=0)
+    max_retries: int = Field(default=3, ge=0, le=10)
     resume_enabled: bool = Field(default=True)
 
     # Telegram Delivery Configuration
     use_local_api: bool = Field(default=False)
     local_api_base_url: str = Field(default="http://localhost:8081")
-    local_api_max_file_size_mb: int = Field(default=2000)
+    local_api_max_file_size_mb: int = Field(default=2000, ge=1)
     default_send_mode: SendMode = Field(default=SendMode.DOCUMENT)
 
     # Logging Configuration
     log_level: str = Field(default="INFO")
-    log_max_bytes: int = Field(default=10485760)
-    log_backup_count: int = Field(default=5)
+    log_max_bytes: int = Field(default=10485760, ge=1024)
+    log_backup_count: int = Field(default=5, ge=1, le=50)
     log_dir: Path = Field(default=Path("./logs"))
 
     # Security Configuration
     max_redirects: int = Field(default=10, ge=1, le=30)
+
+    @field_validator("local_api_base_url")
+    @classmethod
+    def validate_local_api(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("LOCAL_API_BASE_URL must be an HTTP(S) endpoint without credentials, query or fragment")
+        return value.rstrip("/")
 
     def ensure_directories(self) -> None:
         """Create necessary directories if they do not exist."""
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+
+    @model_validator(mode="after")
+    def validate_runtime_layout(self):
+        jobs = self.jobs_dir.resolve()
+        protected = [self.database_path, self.log_dir, self.data_dir / "backups"]
+        protected.extend(p for p in (self.ytdlp_cookies_file, self.ytdlp_profiles_file) if p)
+        if any(path.resolve().is_relative_to(jobs) for path in protected):
+            raise ValueError("Job storage must not contain the database, logs, backups or session secrets")
+        return self
 
 
 # Lazy singleton pattern to avoid immediate instantiation during tests

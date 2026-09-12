@@ -42,6 +42,7 @@ class ProcessSupervisor:
         self.terminate_grace_seconds = terminate_grace_seconds
         self._processes: dict[tuple[str, str], asyncio.subprocess.Process] = {}
         self._lock = asyncio.Lock()
+        self._closed = False
 
     @property
     def active_count(self) -> int:
@@ -60,13 +61,43 @@ class ProcessSupervisor:
             kwargs["creationflags"] = kwargs.get("creationflags", 0) | 0x00000200
         else:
             kwargs["start_new_session"] = True
-        process = await asyncio.create_subprocess_exec(*cmd, **kwargs)
-        async with self._lock:
-            existing = self._processes.get((job_id, stage))
-            if existing and existing.returncode is None:
-                await self._terminate_handle(existing)
-            self._processes[(job_id, stage)] = process
-        return process
+        async def create_and_register():
+            async with self._lock:
+                if self._closed:
+                    raise RuntimeError("Process supervisor is shutting down")
+                existing = self._processes.get((job_id, stage))
+                if existing and existing.returncode is None:
+                    raise RuntimeError("A process already owns this job stage")
+                process = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+                self._processes[(job_id, stage)] = process
+                return process
+
+        creation = asyncio.create_task(create_and_register())
+        try:
+            return await asyncio.shield(creation)
+        except asyncio.CancelledError:
+            # Creation may have reached the OS before cancellation was delivered.
+            while not creation.done():
+                try:
+                    await asyncio.shield(creation)
+                except asyncio.CancelledError:
+                    continue
+            if not creation.cancelled() and creation.exception() is None:
+                process = creation.result()
+                await self.reap_owned(job_id, stage, process)
+            raise
+
+    async def reap_owned(self, job_id: str, stage: str, process) -> None:
+        async def finish():
+            await self._terminate_handle(process)
+            await self.unregister(job_id, stage, process)
+        cleanup = asyncio.create_task(finish())
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        await cleanup
 
     async def run(
         self,
@@ -121,6 +152,7 @@ class ProcessSupervisor:
             await termination
             raise
         finally:
+            await self.reap_owned(job_id, stage, process)
             for reader in readers:
                 if not reader.done():
                     reader.cancel()
@@ -152,6 +184,7 @@ class ProcessSupervisor:
 
     async def shutdown(self) -> None:
         async with self._lock:
+            self._closed = True
             processes = list(self._processes.values())
         await asyncio.gather(
             *(self._terminate_handle(process) for process in processes),
@@ -191,8 +224,7 @@ class ProcessSupervisor:
                 await self._terminate_handle(process)
             finally:
                 self.terminate_grace_seconds = old_grace
-        else:
-            self._send_term(pid)
+        # Persisted or external PIDs never confer ownership.
 
     @staticmethod
     async def kill_process_tree(pid: int) -> None:

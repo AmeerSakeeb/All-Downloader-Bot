@@ -11,6 +11,7 @@ from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 from core.config import ResourceMode, Settings
+from core.exceptions import BotError
 from core.models import (
     AudioCodec, DetailStyle, FavoriteFormatRule, MatchingStrategy, MediaFormat,
     MediaSession, VideoCodec,
@@ -582,6 +583,22 @@ async def _child_session(
     parent: MediaSession, item, user_id: int, registry: ExtractorRegistry,
     governor: ResourceGovernor,
 ) -> MediaSession | None:
+    if parent.collection_depth >= governor.settings.max_collection_depth:
+        return None
+    try:
+        child = await _extract_child_session(parent, item, user_id, registry, governor)
+        if child:
+            child.collection_depth = parent.collection_depth + 1
+        return child
+    except (BotError, ValueError, OSError):
+        # One unavailable child must not abort a batch or Download All preparation.
+        return None
+
+
+async def _extract_child_session(
+    parent: MediaSession, item, user_id: int, registry: ExtractorRegistry,
+    governor: ResourceGovernor,
+) -> MediaSession | None:
     if item.kind == "image":
         class Asset:
             asset_id = item.item_id
@@ -602,6 +619,7 @@ async def _child_session(
             collection_entry_index=item.collection_entry_index if uses_parent else None,
             collection_entry_id=item.collection_entry_id if uses_parent else None,
             ytdlp_impersonated=parent.ytdlp_impersonated,
+            cookie_profile=parent.cookie_profile,
         )
     lease, _ = await governor.acquire_stage("extraction")
     if not lease:
@@ -609,13 +627,23 @@ async def _child_session(
     async with lease:
         await asyncio.to_thread(SSRFGuard.validate_url, item.source_url)
         extractor = await registry.get_extractor_for_url(item.source_url)
-        return await extractor.extract(
+        child = await extractor.extract(
             item.source_url, user_id, operation_id=f"collection-{uuid.uuid4().hex}",
             **(
                 {"prefer_impersonation": True}
                 if parent.ytdlp_impersonated else {}
             ),
+            **({"cookie_profile": parent.cookie_profile} if parent.cookie_profile else {}),
         )
+        if not item.webpage_url and item.parent_collection_url:
+            exact = next((entry for entry in child.items
+                          if entry.collection_entry_index == item.collection_entry_index
+                          and item.collection_entry_id
+                          and entry.collection_entry_id == item.collection_entry_id), None)
+            if not exact or not exact.formats:
+                return None
+            return await _extract_child_session(child, exact, user_id, registry, governor)
+        return child
 
 
 @router.callback_query(F.data.startswith("collection:"))
@@ -823,7 +851,7 @@ async def collection_item(
         return
     child = await _child_session(parent, item, callback.from_user.id, extractor_registry, governor)
     if not child:
-        await callback.answer("The server is busy. Try this item again shortly.", show_alert=True)
+        await callback.answer("This item is unavailable, the nesting limit was reached, or the server is busy.", show_alert=True)
         return
     await db.save_media_session(child)
     if item.kind == "image":
@@ -918,6 +946,7 @@ async def process_selected(
     for item in (item for item in session.items if item.item_id in selected):
         child = await _child_session(session, item, callback.from_user.id, extractor_registry, governor)
         if not child:
+            await cast(Any, callback.message).answer(f"⚠️ {escape(item.title[:150])}: this item could not be prepared.")
             continue
         await db.save_media_session(child)
         if item.kind == "image":
@@ -960,8 +989,10 @@ async def admin_actions(
     action = (callback.data or "").split(":", 1)[-1]
     if action == "pause":
         scheduler.pause_new_jobs()
+        await db.set_system_setting("scheduler_paused", "true")
     elif action == "resume":
         scheduler.resume_new_jobs()
+        await db.set_system_setting("scheduler_paused", "false")
     elif action == "cleanup":
         await db.delete_expired_sessions()
     elif action == "users":

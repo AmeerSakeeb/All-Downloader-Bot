@@ -18,6 +18,8 @@ def is_healthy(settings: Settings) -> bool:
             return False
         if state.get("database_ok") is not True or state.get("scheduler_alive") is not True:
             return False
+        if any(state.get(key) is not True for key in ("proxy_alive", "maintenance_alive", "maintenance_ok")):
+            return False
         database_uri = settings.database_path.resolve().as_uri() + "?mode=ro"
         with sqlite3.connect(database_uri, uri=True, timeout=2) as connection:
             connection.execute("SELECT version FROM schema_migrations LIMIT 1").fetchone()

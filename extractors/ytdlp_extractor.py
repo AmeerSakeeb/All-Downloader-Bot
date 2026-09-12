@@ -23,6 +23,7 @@ from security.proxy import ControlledOutboundProxy
 from security.ssrf import SSRFGuard
 from security.url_logging import sanitize_url_for_log
 from services.ytdlp_policy import CookieFileUnavailableError, YtDlpPolicy
+from services.cookie_profiles import CookieProfiles, CookieProfileError
 
 logger = logging.getLogger(__name__)
 
@@ -35,18 +36,20 @@ class YtDlpExtractor(Extractor):
         settings: Settings | None = None,
         supervisor: ProcessSupervisor | None = None,
         proxy_url: str | None = None,
+        profiles: CookieProfiles | None = None,
     ):
         self.settings = settings
         self.timeout_secs = timeout_secs
         self.supervisor = supervisor or ProcessSupervisor()
         self.proxy_url = proxy_url
+        self.profiles = profiles
 
     async def can_extract(self, url: str) -> bool:
         return True
 
     async def extract(
         self, url: str, user_id: int, *, operation_id: str | None = None,
-        prefer_impersonation: bool = False,
+        prefer_impersonation: bool = False, cookie_profile: str | None = None,
     ) -> MediaSession:
         settings = self.settings or get_settings()
         timeout_secs = self.timeout_secs or settings.ytdlp_timeout
@@ -58,17 +61,17 @@ class YtDlpExtractor(Extractor):
             proxy_url = await temporary_proxy.start()
         try:
             process_owner = operation_id or f"extraction-{uuid.uuid4().hex}"
-            policy = YtDlpPolicy(settings, proxy_url)
-            attempts = [True] if prefer_impersonation else [False]
-            if settings.ytdlp_impersonation_fallback and not prefer_impersonation:
-                attempts.append(True)
-            for attempt_index, impersonated in enumerate(attempts):
-                attempt_type = self._attempt_type(policy.authenticated, impersonated)
+            policy = YtDlpPolicy(settings, proxy_url, self.profiles)
+            impersonated = prefer_impersonation
+            profile_name = cookie_profile
+            for attempt_index in range(3):
+                attempt_type = self._attempt_type(bool(profile_name), impersonated)
                 try:
                     command = self._build_command(
-                        url, settings, policy, impersonated=impersonated
+                        url, settings, policy, impersonated=impersonated,
+                        profile_name=profile_name,
                     )
-                except CookieFileUnavailableError as error:
+                except (CookieFileUnavailableError, CookieProfileError) as error:
                     logger.error(
                         "yt-dlp extraction configuration failure site=%s attempt=%s category=cookie_file_unavailable",
                         urlsplit(url).hostname or "unknown", attempt_type,
@@ -90,7 +93,8 @@ class YtDlpExtractor(Extractor):
                         url, attempt_type, returncode=None, timed_out=True,
                         diagnostic="", category="extraction_timeout",
                     )
-                    if attempt_index + 1 < len(attempts):
+                    if settings.ytdlp_impersonation_fallback and not impersonated:
+                        impersonated = True
                         continue
                     raise ExtractionTimeoutError() from error
                 if result.returncode == 0:
@@ -109,30 +113,36 @@ class YtDlpExtractor(Extractor):
                     )
                     return self._build_session(
                         metadata, url, user_id, settings,
-                        impersonated=impersonated,
+                        impersonated=impersonated, profile_name=profile_name,
                     )
                 diagnostic = result.stderr.decode("utf-8", errors="replace")[-4000:]
                 category = self._classify_failure(diagnostic)
                 self._log_attempt(
                     url, attempt_type, returncode=result.returncode,
-                    timed_out=False, diagnostic=self._safe_diagnostic(
+                    timed_out=False, diagnostic="<session diagnostic redacted>" if profile_name else self._safe_diagnostic(
                         diagnostic, settings.ytdlp_cookies_file
                     ), category=category,
                 )
                 if category == "authentication_required":
+                    profile = self.profiles.select(url) if self.profiles and not profile_name else None
+                    if profile:
+                        profile_name = profile.name
+                        continue
                     raise AuthenticationRequiredError()
                 if category == "unsupported_url":
                     raise UnsupportedUrlError(sanitize_url_for_log(url))
                 if category == "drm_unsupported":
                     raise DRMProtectedError(sanitize_url_for_log(url))
                 if category == "site_access_challenge":
-                    if attempt_index + 1 < len(attempts):
+                    if settings.ytdlp_impersonation_fallback and not impersonated:
+                        impersonated = True
                         continue
                     raise SiteAccessChallengeError()
                 raise ExtractionError(
                     "yt-dlp could not analyze this media URL",
                     user_message="The website could not be analyzed safely. Please try again later.",
                 )
+            raise ExtractionError("The bounded extraction attempt budget was exhausted")
         except FileNotFoundError as error:
             raise ExtractionError("yt-dlp is not installed") from error
         finally:
@@ -141,23 +151,24 @@ class YtDlpExtractor(Extractor):
 
     @staticmethod
     def _build_command(
-        url: str, settings: Settings, policy: YtDlpPolicy, *, impersonated: bool
+        url: str, settings: Settings, policy: YtDlpPolicy, *, impersonated: bool,
+        profile_name: str | None = None,
     ) -> list[str]:
         return [
-            "yt-dlp",
+            *policy.executable(),
             "--dump-single-json",
             "--skip-download",
             "--no-check-formats",
             "--playlist-end",
             str(settings.max_collection_items),
             "--no-warnings",
-            *policy.common_args(impersonate=impersonated),
+            *policy.common_args(impersonate=impersonated, url=url, profile_name=profile_name),
             url,
         ]
 
     def _build_session(
         self, metadata: dict[str, Any], url: str, user_id: int,
-        settings: Settings, *, impersonated: bool,
+        settings: Settings, *, impersonated: bool, profile_name: str | None = None,
     ) -> MediaSession:
         self._validate_extracted_urls(metadata)
         raw_formats = metadata.get("formats") or ([metadata] if metadata.get("url") else [])
@@ -193,6 +204,7 @@ class YtDlpExtractor(Extractor):
             items=items,
             formats=formats,
             ytdlp_impersonated=impersonated,
+            cookie_profile=profile_name,
         )
 
     @staticmethod

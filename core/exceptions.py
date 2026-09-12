@@ -125,7 +125,7 @@ class AuthenticationRequiredError(ExtractionError):
     def __init__(self):
         super().__init__(
             "The source requires an authenticated session",
-            user_message="This media requires an authorized session that is not configured.",
+            user_message="An authorized session is required for this source. The configured session may be absent or expired.",
         )
 
 

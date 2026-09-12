@@ -686,7 +686,11 @@ def build_admin_keyboard(paused: bool) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="👥 Users", callback_data="admin:users"),
         InlineKeyboardButton(text="⚙️ Resources", callback_data="admin:resources"),
     )
-    builder.row(InlineKeyboardButton(text="🧹 Cleanup expired sessions", callback_data="admin:cleanup"))
+    builder.row(InlineKeyboardButton(text="🩺 Diagnostics", callback_data="ops:status"),
+                InlineKeyboardButton(text="📋 Queue", callback_data="ops:queue"))
+    builder.row(InlineKeyboardButton(text="🔐 Authorized Sessions", callback_data="ops:sessions"))
+    builder.row(InlineKeyboardButton(text="🧹 Maintenance", callback_data="ops:cleanup"),
+                InlineKeyboardButton(text="💾 Database backup", callback_data="ops:backup"))
     return builder.as_markup()
 
 

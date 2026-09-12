@@ -15,7 +15,7 @@ from core.models import (
     MediaFormat, MediaSession, UserSettings,
 )
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 ACTIVE_STATUSES = tuple(
     status.value
     for status in (
@@ -41,6 +41,7 @@ class Database:
         self.db_path = Path(db_path)
         self.default_send_mode = default_send_mode
         self._db: Optional[aiosqlite.Connection] = None
+        self.ui_draft_ttl_seconds = 86400
 
     @property
     def connection(self) -> aiosqlite.Connection:
@@ -91,6 +92,7 @@ class Database:
             5: self._migration_v5,
             6: self._migration_v6,
             7: self._migration_v7,
+            8: self._migration_v8,
         }
         for version in range(current + 1, CURRENT_SCHEMA_VERSION + 1):
             await db.execute("BEGIN IMMEDIATE")
@@ -395,6 +397,14 @@ class Database:
                 "ALTER TABLE download_jobs ADD COLUMN ytdlp_impersonated INTEGER NOT NULL DEFAULT 0"
             )
 
+    async def _migration_v8(self) -> None:
+        for statement in (
+            "CREATE INDEX IF NOT EXISTS idx_jobs_retention ON download_jobs(status,updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_cache_retention ON telegram_file_cache(last_used_at)",
+            "CREATE INDEX IF NOT EXISTS idx_drafts_retention ON ui_drafts(updated_at)",
+        ):
+            await self.connection.execute(statement)
+
     async def schema_version(self) -> int:
         row = await (
             await self.connection.execute(
@@ -449,6 +459,7 @@ class Database:
                 "collection_truncated", "thumbnails", "subtitles", "items",
                 "parent_collection_url", "collection_entry_index", "collection_entry_id",
                 "ytdlp_impersonated",
+                "cookie_profile", "collection_depth",
             },
         )
         await self.connection.execute(
@@ -545,6 +556,8 @@ class Database:
             "collection_entry_index": session.collection_entry_index,
             "collection_entry_id": session.collection_entry_id,
             "ytdlp_impersonated": session.ytdlp_impersonated,
+            "cookie_profile": session.cookie_profile,
+            "source_media_id": session.media_id,
         }
         job = DownloadJob(
             media_session_id=session.session_id,
@@ -564,6 +577,8 @@ class Database:
             collection_entry_index=session.collection_entry_index,
             collection_entry_id=session.collection_entry_id,
             ytdlp_impersonated=session.ytdlp_impersonated,
+            cookie_profile=session.cookie_profile,
+            source_media_id=session.media_id,
         )
         # A separate connection isolates this short transaction from concurrent
         # progress/reservation writes on the application's main connection.
@@ -643,6 +658,8 @@ class Database:
             "collection_entry_index": job.collection_entry_index,
             "collection_entry_id": job.collection_entry_id,
             "ytdlp_impersonated": job.ytdlp_impersonated,
+            "cookie_profile": job.cookie_profile,
+            "source_media_id": job.source_media_id,
         }
         return (
             job.job_id,
@@ -690,6 +707,8 @@ class Database:
             "collection_entry_index": job.collection_entry_index,
             "collection_entry_id": job.collection_entry_id,
             "ytdlp_impersonated": job.ytdlp_impersonated,
+            "cookie_profile": job.cookie_profile,
+            "source_media_id": job.source_media_id,
         }
         await self.connection.execute(
             """UPDATE download_jobs SET message_id=?,status=?,progress_pct=?,
@@ -1068,8 +1087,8 @@ class Database:
     ) -> Optional[dict[str, Any]]:
         row = await (
             await self.connection.execute(
-                "SELECT draft_json FROM ui_drafts WHERE user_id=? AND draft_key=?",
-                (int(user_id), draft_key),
+                "SELECT draft_json FROM ui_drafts WHERE user_id=? AND draft_key=? AND updated_at>?",
+                (int(user_id), draft_key, time.time() - self.ui_draft_ttl_seconds),
             )
         ).fetchone()
         return json.loads(row["draft_json"]) if row else None
@@ -1079,6 +1098,13 @@ class Database:
             "DELETE FROM ui_drafts WHERE user_id=? AND draft_key=?",
             (int(user_id), draft_key),
         )
+
+    async def consume_ui_draft(self, user_id: int, draft_key: str) -> Optional[dict[str, Any]]:
+        row = await (await self.connection.execute(
+            "DELETE FROM ui_drafts WHERE user_id=? AND draft_key=? RETURNING draft_json",
+            (user_id, draft_key),
+        )).fetchone()
+        return json.loads(row[0]) if row else None
 
     async def get_cached_file(self, output_identity: str) -> Optional[dict[str, Any]]:
         row = await (
@@ -1210,6 +1236,10 @@ class Database:
             if waiting:
                 await db.commit()
                 return None
+            delivered = await (await db.execute(
+                "SELECT 1 FROM job_subscribers WHERE job_id=? AND status='delivered' LIMIT 1", (job_id,)
+            )).fetchone()
+            delivered_any = delivered_any or bool(delivered)
             status = JobStatus.COMPLETED if delivered_any else JobStatus.FAILED
             category = None if delivered_any else "telegram_delivery_failed"
             message = (
@@ -1269,6 +1299,8 @@ class Database:
         return int(row["total"]) if row else 0
 
     async def mark_subscriber(self, subscriber_id: str, status: str) -> None:
+        if status not in {"delivered", "failed", "cancelled"}:
+            raise ValueError("Invalid recipient terminal state")
         await self.connection.execute(
             "UPDATE job_subscribers SET status=? WHERE subscriber_id=? AND status='waiting'",
             (status, subscriber_id),
@@ -1393,4 +1425,46 @@ class Database:
         data["source_url"] = data.get("source_url") or snapshot.get("source_url")
         data["canonical_url"] = data.get("canonical_url") or snapshot.get("canonical_url")
         data["extractor"] = data.get("extractor") or snapshot.get("extractor")
+        data["cookie_profile"] = snapshot.get("cookie_profile")
+        data["source_media_id"] = snapshot.get("source_media_id")
         return DownloadJob.model_validate(data)
+
+    async def maintain(self, *, job_days: int, cache_days: int) -> dict[str, int]:
+        """Bound each deletion batch and never delete an active job's records."""
+        now = time.time()
+        counts = {}
+        async with aiosqlite.connect(str(self.db_path), isolation_level=None) as db:
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                for name, sql, args in (
+                    ("drafts", "DELETE FROM ui_drafts WHERE rowid IN (SELECT rowid FROM ui_drafts WHERE updated_at<? LIMIT 500)", (now-self.ui_draft_ttl_seconds,)),
+                    ("cache", "DELETE FROM telegram_file_cache WHERE rowid IN (SELECT rowid FROM telegram_file_cache WHERE last_used_at<? LIMIT 500)", (now-cache_days*86400,)),
+                    ("reservations", "DELETE FROM disk_reservations WHERE job_id NOT IN (SELECT job_id FROM download_jobs WHERE status IN ('queued','claimed','waiting_resources','downloading_video','downloading_audio','merging','uploading'))", ()),
+                    ("subscribers", "DELETE FROM job_subscribers WHERE job_id IN (SELECT job_id FROM download_jobs WHERE status IN ('completed','failed','cancelled') AND updated_at<? LIMIT 500)", (now-job_days*86400,)),
+                    ("jobs", "DELETE FROM download_jobs WHERE job_id IN (SELECT job_id FROM download_jobs WHERE status IN ('completed','failed','cancelled') AND updated_at<? LIMIT 500)", (now-job_days*86400,)),
+                    ("orphan_subscribers", "DELETE FROM job_subscribers WHERE rowid IN (SELECT rowid FROM job_subscribers WHERE job_id NOT IN (SELECT job_id FROM download_jobs) LIMIT 500)", ()),
+                ):
+                    cursor = await db.execute(sql, args)
+                    counts[name] = cursor.rowcount
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+            await db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        counts["sessions"] = await self.delete_expired_sessions()
+        return counts
+
+    async def backup_to(self, destination: Path) -> None:
+        """SQLite online backup on a separate source connection; no live WAL copying."""
+        async with aiosqlite.connect(str(self.db_path)) as source:
+            async with aiosqlite.connect(str(destination)) as target:
+                await source.backup(target, pages=128, sleep=0.05)
+
+    async def recent_error_counts(self) -> dict[str, int]:
+        rows = await (await self.connection.execute(
+            "SELECT error_category,COUNT(*) FROM download_jobs WHERE updated_at>? AND error_category IS NOT NULL GROUP BY error_category",
+            (time.time()-86400,),
+        )).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}

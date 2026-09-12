@@ -14,7 +14,7 @@ class Extractor(Protocol):
 
     async def extract(
         self, url: str, user_id: int, *, operation_id: str | None = None,
-        prefer_impersonation: bool = False,
+        prefer_impersonation: bool = False, cookie_profile: str | None = None,
     ) -> MediaSession:
         """
         Extract metadata and available formats for the given URL.

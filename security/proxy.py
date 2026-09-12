@@ -27,6 +27,10 @@ class ControlledOutboundProxy:
         assert self.url is not None
         return self.url
 
+    @property
+    def is_alive(self) -> bool:
+        return bool(self._server and self._server.is_serving())
+
     async def close(self) -> None:
         if self._server:
             self._server.close()

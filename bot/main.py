@@ -19,6 +19,7 @@ from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot.callbacks import router as callbacks_router
 from bot.callbacks.phase2 import router as phase2_callbacks_router
+from bot.callbacks.operations import router as operations_router
 from bot.handlers.commands import router as commands_router
 from bot.handlers.media import router as media_router
 from bot.middleware.access import AccessControlMiddleware
@@ -35,6 +36,8 @@ from jobqueue.scheduler import JobScheduler
 from resources.governor import ResourceGovernor
 from security.proxy import ControlledOutboundProxy
 from services.telegram_api import TelegramService
+from services.cookie_profiles import CookieProfiles
+from services.maintenance import MaintenanceService
 from storage.database import Database
 from storage.file_manager import FileManager
 from ui.builders import build_progress_keyboard, build_progress_text
@@ -62,6 +65,11 @@ class BotApplication:
         self.proxy: Optional[ControlledOutboundProxy] = None
         self.extractor_registry: Optional[ExtractorRegistry] = None
         self._cleanup_task: Optional[asyncio.Task[None]] = None
+        self._maintenance_task: Optional[asyncio.Task[None]] = None
+        self.cookie_profiles: Optional[CookieProfiles] = None
+        self.maintenance: Optional[MaintenanceService] = None
+        self.started_at = time.monotonic()
+        self._handler_tasks: set[asyncio.Task] = set()
         self._progress_last: dict[str, float] = {}
         self._shutdown = False
         self.health_file = self.settings.data_dir / "health.json"
@@ -76,18 +84,23 @@ class BotApplication:
         )
         self.db = Database(self.settings.database_path, self.settings.default_send_mode.value)
         await self.db.connect()
+        self.db.ui_draft_ttl_seconds = self.settings.ui_draft_ttl_hours * 3600
         await self.db.bootstrap_admins(self.settings.admin_user_ids)
         saved_resource_mode = await self.db.get_system_setting("resource_mode")
         if saved_resource_mode:
             self.settings.resource_mode = ResourceMode(saved_resource_mode)
         self.file_mgr = FileManager(self.settings.jobs_dir)
+        self.cookie_profiles = CookieProfiles(self.settings, self.db)
+        await self.cookie_profiles.refresh()
+        self.maintenance = MaintenanceService(self.db, self.file_mgr, self.settings)
         self.supervisor = ProcessSupervisor(
             self.settings.process_terminate_grace_seconds
         )
         self.proxy = ControlledOutboundProxy()
         proxy_url = await self.proxy.start()
         self.extractor_registry = ExtractorRegistry(
-            settings=self.settings, supervisor=self.supervisor, proxy=self.proxy
+            settings=self.settings, supervisor=self.supervisor, proxy=self.proxy,
+            profiles=self.cookie_profiles,
         )
         self.governor = ResourceGovernor(self.db, self.file_mgr, self.settings)
         downloader = Downloader(
@@ -96,6 +109,7 @@ class BotApplication:
             supervisor=self.supervisor,
             proxy_url=proxy_url,
             growth_check=self.governor.growth_is_safe,
+            profiles=self.cookie_profiles,
         )
         ffmpeg = FFmpegManager(self.supervisor)
         self.queue_mgr = QueueManager(self.db, self.file_mgr, self.supervisor)
@@ -121,12 +135,17 @@ class BotApplication:
                     continue
                 try:
                     if telegram_file_id:
-                        await self.telegram_service.send_cached(
-                            subscriber["chat_id"], telegram_file_id,
-                            subscriber["send_mode"],
-                            "Exact output delivered from a shared private download.",
-                        )
-                    else:
+                        try:
+                            await self.telegram_service.send_cached(
+                                subscriber["chat_id"], telegram_file_id,
+                                subscriber["send_mode"],
+                                "Exact output delivered from a shared private download.",
+                            )
+                        except Exception:
+                            telegram_file_id = job.telegram_file_id = None
+                            if job.output_identity:
+                                await self.db.invalidate_cached_file(job.output_identity)
+                    if not telegram_file_id:
                         delivery_job = job.model_copy(update={
                             "chat_id": subscriber["chat_id"],
                             "message_id": subscriber["message_id"],
@@ -185,9 +204,12 @@ class BotApplication:
             telegram_service=self.telegram_service,
         )
         await self.queue_mgr.reconcile_on_startup()
+        if await self.db.get_system_setting("scheduler_paused") == "true":
+            self.scheduler.pause_new_jobs()
 
         self.dp = Dispatcher()
         self.dp["db"] = self.db
+        self.dp["application"] = self
         self.dp["settings"] = self.settings
         self.dp["resource_governor"] = self.governor
         self.dp["governor"] = self.governor
@@ -196,7 +218,7 @@ class BotApplication:
         self.dp["telegram_service"] = self.telegram_service
         self.dp["extractor_registry"] = self.extractor_registry
         access = AccessControlMiddleware(self.db, self.settings)
-        logging_middleware = LoggingMiddleware()
+        logging_middleware = LoggingMiddleware(self._handler_tasks)
         self.dp.message.outer_middleware(access)
         self.dp.callback_query.outer_middleware(access)
         self.dp.message.middleware(logging_middleware)
@@ -204,12 +226,15 @@ class BotApplication:
         self.dp.include_router(commands_router)
         self.dp.include_router(media_router)
         self.dp.include_router(phase2_callbacks_router)
+        self.dp.include_router(operations_router)
         self.dp.include_router(callbacks_router)
 
+        await self.maintenance.run()
         await self.scheduler.start()
         self._cleanup_task = asyncio.create_task(
-            self._maintenance_loop(), name="session-cleanup-and-health"
+            self._health_loop(), name="application-health"
         )
+        self._maintenance_task = asyncio.create_task(self._maintenance_loop(), name="runtime-maintenance")
 
     async def _update_progress(self, job: DownloadJob) -> None:
         if not self.bot:
@@ -223,6 +248,8 @@ class BotApplication:
         if not terminal and now - self._progress_last.get(job.job_id, 0.0) < 2.0:
             return
         self._progress_last[job.job_id] = now
+        if terminal:
+            self._progress_last.pop(job.job_id, None)
         if self.db and not terminal:
             for recipient in await self.db.list_job_subscribers(job.job_id):
                 if not recipient["message_id"]:
@@ -257,17 +284,24 @@ class BotApplication:
                         logger.debug("Subscriber terminal edit was rejected", exc_info=True)
 
     async def _maintenance_loop(self) -> None:
-        assert self.db is not None
+        assert self.maintenance is not None
         while True:
             try:
-                await self._write_health()
-                await self.db.delete_expired_sessions()
-                await asyncio.sleep(30)
+                await self.maintenance.run()
+                await asyncio.sleep(self.settings.maintenance_interval_seconds)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Maintenance iteration failed")
                 await asyncio.sleep(10)
+
+    async def _health_loop(self) -> None:
+        while True:
+            try:
+                await self._write_health()
+            except Exception:
+                logger.exception("Health heartbeat failed")
+            await asyncio.sleep(30)
 
     async def _write_health(self) -> None:
         database_ok = False
@@ -280,8 +314,16 @@ class BotApplication:
             "timestamp": time.time(),
             "database_ok": database_ok,
             "scheduler_alive": bool(self.scheduler and self.scheduler.is_alive),
+            "proxy_alive": bool(self.proxy and self.proxy.is_alive),
+            "maintenance_alive": bool(self._maintenance_task and not self._maintenance_task.done()),
+            "maintenance_ok": bool(self.maintenance and self.maintenance.last_success and
+                time.time() - self.maintenance.last_success < self.settings.maintenance_interval_seconds + 120),
         })
-        await asyncio.to_thread(self.health_file.write_text, payload, "utf-8")
+        def write_atomic():
+            pending = self.health_file.with_suffix(".tmp")
+            pending.write_text(payload, encoding="utf-8")
+            pending.replace(self.health_file)
+        await asyncio.to_thread(write_atomic)
 
     async def start(self) -> None:
         if not self.bot or not self.dp:
@@ -312,12 +354,21 @@ class BotApplication:
             return
         self._shutdown = True
         if self.scheduler:
+            self.scheduler.pause_new_jobs()
+        for task in (self._cleanup_task, self._maintenance_task):
+            if task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        handlers = [task for task in self._handler_tasks if task is not asyncio.current_task()]
+        for task in handlers:
+            task.cancel()
+        await asyncio.gather(*handlers, return_exceptions=True)
+        if self.scheduler:
             await self.scheduler.stop()
         if self.queue_mgr:
             await self.queue_mgr.prepare_shutdown()
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            await asyncio.gather(self._cleanup_task, return_exceptions=True)
+        if self.supervisor:
+            await self.supervisor.shutdown()
         if self.proxy:
             await self.proxy.close()
         if self.bot:
