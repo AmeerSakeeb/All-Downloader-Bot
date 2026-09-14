@@ -4,12 +4,12 @@ import pytest
 
 from bot.callbacks.phase2 import (
     _filters, admin_actions, all_formats, performance_adjust,
-    performance_advanced, performance_reset, queue_download_all,
+    performance_advanced, performance_reset, prepare_download_all, queue_download_all,
 )
 from bot.handlers.media import extract_urls_from_text, handle_potential_url
 from core.config import Settings
 from core.exceptions import ExtractionError
-from core.models import DownloadJob, JobStatus, MediaSession
+from core.models import DownloadJob, JobStatus, MediaItem, MediaSession
 from services.runtime_settings import RuntimeSettingsService
 from services.telegram_api import TelegramService
 from ui.builders import build_progress_text
@@ -307,3 +307,92 @@ async def test_batch_child_failure_does_not_destroy_other_items(
     assert len(batch.items) == 4
     assert [item.analysis_status for item in batch.items].count("ready") == 3
     assert [item.analysis_status for item in batch.items].count("failed") == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_download_ready_skips_nonready_items(
+    db, settings, video_format, monkeypatch,
+):
+    """Ready items are queued; analyzing/waiting/failed are NOT re-extracted."""
+    from bot.callbacks.phase2 import prepare_download_all
+
+    class Lease:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FileManager:
+        @staticmethod
+        def get_free_disk_space():
+            return 10**12
+
+    class Governor:
+        def __init__(self):
+            self.settings = settings
+            self.file_mgr = FileManager()
+
+        @staticmethod
+        def disk_safety_bytes():
+            return 0
+
+        @staticmethod
+        async def acquire_stage(stage):
+            return Lease(), "Ready"
+
+    class Extractor:
+        async def extract(self, url, user_id, **kwargs):
+            if "bad.example" in url:
+                raise ExtractionError("unavailable")
+            return MediaSession.with_ttl(
+                ttl_seconds=settings.media_session_ttl, user_id=user_id, url=url,
+                extractor="test", title=url.split("//", 1)[1].split(".", 1)[0].title(),
+                formats=[video_format],
+            )
+
+    class Registry:
+        @staticmethod
+        async def get_extractor_for_url(url):
+            return Extractor()
+
+    parent = MediaSession.with_ttl(
+        ttl_seconds=settings.media_session_ttl, user_id=1,
+        url="https://batch.example/post", extractor="batch", title="Four links",
+        session_kind="batch",
+    )
+    await db.save_media_session(parent)
+
+    statuses = ["ready", "ready", "analyzing", "failed"]
+    for i, status in enumerate(statuses):
+        item = MediaItem(
+            kind="video", source_url=f"https://item{i}.example/v",
+            title=f"Item {i}", analysis_status=status,
+        )
+        if status == "ready":
+            item.formats = [video_format.model_copy(update={
+                "format_id": f"format-{i}", "internal_key": f"key{i}",
+                "is_muxed": True, "requires_separate_audio": False,
+            })]
+        parent.items.append(item)
+    await db.save_media_session(parent)
+
+    callback = Callback(1, f"allmedia:{parent.session_id}")
+    await prepare_download_all(
+        callback, db, Registry(), Governor(),
+    )
+
+    assert callback.message.edited_text is not None
+    text = callback.message.edited_text
+    assert "Still analyzing" in text
+    assert "Waiting for analysis" not in text
+    assert "Analysis failed" in text
+    draft = await db.get_ui_draft(1, f"download-all:{parent.session_id}")
+    assert draft is not None
+    assert len(draft["choices"]) == 2
+
+    for item in parent.items:
+        if item.analysis_status == "ready":
+            assert any(c["title"] == item.title for c in draft["choices"])
+        elif item.analysis_status in ("analyzing", "failed"):
+            assert not any(c["title"] == item.title for c in draft["choices"])

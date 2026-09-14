@@ -731,12 +731,40 @@ async def prepare_download_all(
         "Configured Favorite rules determine each exact video stream.", "",
     ]
     for index, item in enumerate(session.items, 1):
-        child = await _child_session(
-            session, item, callback.from_user.id, extractor_registry, governor
-        )
-        if not child:
-            lines.append(f"{index}. ⏳ Temporarily unavailable")
-            continue
+        if session.session_kind == "batch":
+            if item.analysis_status == "ready":
+                child = MediaSession.with_ttl(
+                    ttl_seconds=max(60, int(session.expires_at - session.created_at)),
+                    user_id=callback.from_user.id,
+                    url=item.source_url,
+                    canonical_url=item.source_url,
+                    extractor=item.source_extractor or session.extractor,
+                    title=item.title,
+                    media_id=item.extractor_id,
+                    thumbnail_url=item.thumbnail_url,
+                    formats=item.formats,
+                    parent_collection_url=item.parent_collection_url or None,
+                    collection_entry_index=item.collection_entry_index or None,
+                    collection_entry_id=item.collection_entry_id or None,
+                    ytdlp_impersonated=session.ytdlp_impersonated,
+                    cookie_profile=session.cookie_profile,
+                )
+            elif item.analysis_status == "analyzing":
+                lines.append(f"{index}. 🔎 Still analyzing")
+                continue
+            elif item.analysis_status == "waiting":
+                lines.append(f"{index}. ⏳ Waiting for analysis")
+                continue
+            else:
+                lines.append(f"{index}. ❌ Analysis failed")
+                continue
+        else:
+            child = await _child_session(
+                session, item, callback.from_user.id, extractor_registry, governor
+            )
+            if not child:
+                lines.append(f"{index}. ⏳ Temporarily unavailable")
+                continue
         await db.save_media_session(child)
         if item.kind == "image" and child.formats:
             fmt = child.formats[0]
