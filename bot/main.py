@@ -25,7 +25,7 @@ from bot.handlers.commands import router as commands_router
 from bot.handlers.media import router as media_router
 from bot.middleware.access import AccessControlMiddleware
 from bot.middleware.logging import LoggingMiddleware
-from core.config import ResourceMode, Settings, get_settings
+from core.config import Settings, get_settings
 from core.logging import setup_logging
 from core.models import DownloadJob, JobStatus
 from downloads.downloader import Downloader
@@ -40,9 +40,10 @@ from services.telegram_api import TelegramService
 from services.cookie_profiles import CookieProfiles
 from services.maintenance import MaintenanceService
 from services.output_identity import build_completed_output_identity
+from services.runtime_settings import RuntimeSettingsService
 from storage.database import Database
 from storage.file_manager import FileManager
-from ui.builders import build_progress_keyboard, build_progress_text
+from ui.builders import build_error_keyboard, build_progress_text
 
 logger = logging.getLogger(__name__)
 
@@ -70,9 +71,11 @@ class BotApplication:
         self._maintenance_task: Optional[asyncio.Task[None]] = None
         self.cookie_profiles: Optional[CookieProfiles] = None
         self.maintenance: Optional[MaintenanceService] = None
+        self.runtime_settings: Optional[RuntimeSettingsService] = None
         self.started_at = time.monotonic()
         self._handler_tasks: set[asyncio.Task] = set()
         self._progress_last: dict[str, float] = {}
+        self._progress_signature: dict[str, tuple[str, str, int]] = {}
         self._shutdown = False
         self.health_file = self.settings.data_dir / "health.json"
 
@@ -88,9 +91,13 @@ class BotApplication:
         await self.db.connect()
         self.db.ui_draft_ttl_seconds = self.settings.ui_draft_ttl_hours * 3600
         await self.db.bootstrap_admins(self.settings.admin_user_ids)
+        self.runtime_settings = RuntimeSettingsService(self.db, self.settings)
+        await self.runtime_settings.initialize()
+        # Import the pre-v10 resource-mode toggle once. New writes use the
+        # typed runtime-settings table exclusively.
         saved_resource_mode = await self.db.get_system_setting("resource_mode")
-        if saved_resource_mode:
-            self.settings.resource_mode = ResourceMode(saved_resource_mode)
+        if saved_resource_mode and not self.runtime_settings.is_overridden("resource_mode"):
+            await self.runtime_settings.set("resource_mode", saved_resource_mode, updated_by=0)
         self.file_mgr = FileManager(self.settings.jobs_dir)
         self.cookie_profiles = CookieProfiles(self.settings, self.db)
         await self.cookie_profiles.refresh()
@@ -210,6 +217,8 @@ class BotApplication:
             extractor_registry=self.extractor_registry,
             telegram_service=self.telegram_service,
         )
+        self.governor.set_capacity_listener(self.scheduler.wake)
+        self.runtime_settings.add_listener(lambda _key, _value: self.scheduler.wake())
         await self.queue_mgr.reconcile_on_startup()
         if await self.db.get_system_setting("scheduler_paused") == "true":
             self.scheduler.pause_new_jobs()
@@ -224,6 +233,7 @@ class BotApplication:
         self.dp["scheduler"] = self.scheduler
         self.dp["telegram_service"] = self.telegram_service
         self.dp["extractor_registry"] = self.extractor_registry
+        self.dp["runtime_settings"] = self.runtime_settings
         access = AccessControlMiddleware(self.db, self.settings)
         logging_middleware = LoggingMiddleware(self._handler_tasks)
         self.dp.message.outer_middleware(access)
@@ -252,11 +262,17 @@ class BotApplication:
             JobStatus.FAILED,
             JobStatus.CANCELLED,
         }
-        if not terminal and now - self._progress_last.get(job.job_id, 0.0) < 2.0:
+        pct_bucket = int(max(0.0, min(100.0, job.progress_pct)) // 5)
+        signature = (job.status.value, job.current_stage, pct_bucket)
+        changed = self._progress_signature.get(job.job_id) != signature
+        periodic = now - self._progress_last.get(job.job_id, 0.0) >= 15.0
+        if not terminal and not changed and not periodic:
             return
         self._progress_last[job.job_id] = now
+        self._progress_signature[job.job_id] = signature
         if terminal:
             self._progress_last.pop(job.job_id, None)
+            self._progress_signature.pop(job.job_id, None)
         if self.db and not terminal:
             for recipient in await self.db.list_job_subscribers(job.job_id):
                 if not recipient["message_id"]:
@@ -286,6 +302,9 @@ class BotApplication:
                             chat_id=subscriber["chat_id"], message_id=subscriber["message_id"],
                             text=("⏹ <b>Shared download cancelled</b>"
                                   if status == "cancelled" else build_progress_text(job)),
+                            reply_markup=(
+                                None if status == "cancelled" else build_error_keyboard(job)
+                            ),
                         )
                     except Exception:
                         logger.debug("Subscriber terminal edit was rejected", exc_info=True)
@@ -346,6 +365,7 @@ class BotApplication:
             BotCommand(command="start", description="Show access status"),
             BotCommand(command="help", description="Show usage help"),
             BotCommand(command="settings", description="Downloader preferences"),
+            BotCommand(command="queue", description="View active and waiting downloads"),
             BotCommand(command="admin", description="Administration panel"),
             BotCommand(command="allow", description="Authorize a user"),
             BotCommand(command="disallow", description="Revoke a user"),

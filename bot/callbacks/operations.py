@@ -36,7 +36,7 @@ async def operations(callback: CallbackQuery, db, application) -> None:
     arg = parts[2] if len(parts) > 2 else ""
     back = [[("🔙 Admin", "admin:status")]]
     try:
-        if action in {"cleanup", "backup", "cancel", "toggle"}:
+        if action in {"cleanup", "backup", "cancel", "cancelwaiting", "toggle"}:
             token = uuid.uuid4().hex
             await db.save_ui_draft(callback.from_user.id, "admin-confirm:" + token, {
                 "action": action, "arg": arg, "expires": time.time() + 120,
@@ -44,6 +44,7 @@ async def operations(callback: CallbackQuery, db, application) -> None:
             labels = {"cleanup": "Clean expired metadata and safe orphan files?",
                       "backup": "Create a private database backup and rotate old backups?",
                       "cancel": "Cancel this shared job for every remaining recipient?",
+                      "cancelwaiting": "Cancel every waiting job? Running healthy jobs will continue.",
                       "toggle": "Change this authorized session's enabled status?"}
             await callback.message.edit_text(labels[action], reply_markup=keyboard([
                 [("Confirm", "ops:confirm:" + token), ("Cancel", "ops:dismiss:" + token)],
@@ -67,6 +68,10 @@ async def operations(callback: CallbackQuery, db, application) -> None:
             elif operation == "cancel":
                 changed = await application.scheduler.cancel_running_job(target)
                 text = "⏹ Job cancelled." if changed else "This job is already terminal or unavailable."
+            elif operation == "cancelwaiting":
+                changed = await db.cancel_all_waiting_jobs()
+                application.scheduler.wake()
+                text = f"⏹ Cancelled {changed} waiting jobs. Running healthy jobs were left alone."
             elif operation == "toggle":
                 profiles = application.cookie_profiles
                 if target not in profiles.profiles:
@@ -79,11 +84,44 @@ async def operations(callback: CallbackQuery, db, application) -> None:
             return
         elif action == "queue":
             jobs = await db.get_active_jobs()
+            governor = application.governor
+            limits = await governor.adaptive_limits()
+            targets = {
+                "download": governor.settings.max_concurrent_downloads,
+                "merge": governor.settings.max_concurrent_merges,
+                "upload": governor.settings.max_concurrent_uploads,
+            }
             page = max(0, int(arg)) if arg.isdigit() else 0
             page = min(page, max(0, (len(jobs)-1)//8))
-            rows = [[(f"⏹ {j.job_id[:8]} · {j.status.value}", "ops:cancel:" + j.job_id)] for j in jobs[page*8:page*8+8]]
+            visible = jobs[page*8:page*8+8]
+            rows = [[(
+                f"⏹ {j.job_id[:8]} · user {j.user_id} · {j.status.value}",
+                "ops:cancel:" + j.job_id,
+            )] for j in visible]
             rows.append([("←", f"ops:queue:{max(0,page-1)}"), ("→", f"ops:queue:{page+1}")])
-            await callback.message.edit_text(f"📋 Active queue: {len(jobs)}\nSelect a job to confirm cancellation.", reply_markup=keyboard(rows+back))
+            rows.append([(
+                "▶️ Resume admissions" if application.scheduler.paused else "⏸ Pause admissions",
+                "admin:resume" if application.scheduler.paused else "admin:pause",
+            )])
+            if any(job.status.value in {"queued", "waiting_resources"} for job in jobs):
+                rows.append([("⏹ Cancel all waiting", "ops:cancelwaiting:all")])
+            waiting = sum(job.status.value in {"queued", "waiting_resources"} for job in jobs)
+            active = len(jobs) - waiting
+            lines = [
+                "📋 <b>Admin Queue</b>", "",
+                f"Active: {active} · Waiting: {waiting} · Total: {len(jobs)}",
+                f"Downloads: {limits['download']} / {targets['download']} effective / target",
+                f"Merges: {limits['merge']} / {targets['merge']} effective / target",
+                f"Uploads: {limits['upload']} / {targets['upload']} effective / target",
+                f"Pressure: {escape(governor.current_pressure_reason(limits))}", "",
+            ]
+            for job in visible:
+                lines.append(
+                    f"<code>{job.job_id[:8]}</code> · user <code>{job.user_id}</code> · "
+                    f"{escape(job.current_stage or job.status.value)}"
+                )
+            lines.extend(("", "Select a job to confirm cancellation."))
+            await callback.message.edit_text("\n".join(lines), reply_markup=keyboard(rows+back))
         elif action in {"sessions", "refresh"}:
             if action == "refresh":
                 await application.cookie_profiles.refresh()
@@ -114,15 +152,27 @@ async def operations(callback: CallbackQuery, db, application) -> None:
         else:
             governor = application.governor
             sample = await governor.detector.sample()
+            limits = await governor.adaptive_limits()
             stats = await db.phase2_stats()
             errors = await db.recent_error_counts()
             free = governor.file_mgr.get_free_disk_space()
-            lines = ["🩺 <b>Diagnostics</b>", f"Version: {__version__}",
+            targets = {
+                "extraction": governor.settings.max_concurrent_extractions,
+                "download": governor.settings.max_concurrent_downloads,
+                "merge": governor.settings.max_concurrent_merges,
+                "upload": governor.settings.max_concurrent_uploads,
+            }
+            lines = ["📊 <b>System Status</b>", f"Version: {__version__}",
                 f"Uptime: {int(time.monotonic()-application.started_at)} seconds",
-                f"Scheduler: {'paused' if application.scheduler.paused else 'running'} / alive={application.scheduler.is_alive}",
-                f"Proxy: {application.proxy.is_alive} · DB: {await db.ping()}",
-                f"Maintenance: {bool(application._maintenance_task and not application._maintenance_task.done())}",
+                f"Bot: {'✅ Healthy' if application.scheduler.is_alive and await db.ping() else '⚠️ Attention required'}",
+                f"Admissions: {'Paused' if application.scheduler.paused else 'Running'}",
                 f"Resource mode: {governor.settings.resource_mode.value}",
+                "", "<b>Concurrency · effective / target</b>",
+                f"Extraction: {limits['extraction']} / {targets['extraction']}",
+                f"Downloads: {limits['download']} / {targets['download']}",
+                f"Merges: {limits['merge']} / {targets['merge']}",
+                f"Uploads: {limits['upload']} / {targets['upload']}",
+                f"Reason: {escape(governor.current_pressure_reason(limits))}", "",
                 f"Disk free: {free//1024**2} MiB · reserved: {(await db.get_total_reserved_bytes())//1024**2} MiB",
                 f"Disk pressure: {free <= governor.disk_safety_bytes()}",
                 f"Memory available: {sample['memory']['available']//1024**2} MiB",

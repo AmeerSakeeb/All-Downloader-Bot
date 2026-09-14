@@ -121,6 +121,13 @@ async def callback_format(
             message_id=message.message_id,
         )
     except QueueLimitError as error:
+        await message.edit_text(
+            f"📋 <b>Queue full</b>\n\nYour selection was not accepted.\n\n{error}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 View Queue", callback_data="queue:mine")],
+                [InlineKeyboardButton(text="🏠 Home", callback_data="home:show")],
+            ]),
+        )
         await callback.answer(str(error), show_alert=True)
         return
     except ValueError:
@@ -139,8 +146,11 @@ async def callback_format(
         await callback.answer("Joined active download")
     else:
         assert result.job is not None
+        position = await db.queue_position(result.job.job_id)
         await message.edit_text(
-            "⏳ <b>Queued</b>\n\nWaiting for safe resource admission.",
+            "⏳ <b>Queued</b>\n\nYour download is saved and will start automatically.\n"
+            + (f"Position: {position}\n" if position else "")
+            + "No resend required.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
                 text="❌ Cancel my delivery", callback_data=f"cancel_sub:{result.subscriber_id}"
             )]]),

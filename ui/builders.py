@@ -116,7 +116,11 @@ def build_format_page_keyboard(
 
 
 def build_progress_text(job: DownloadJob) -> str:
-    """Build rich text progress indicators with throttling safe display."""
+    """Build truthful stage and progress indicators.
+
+    ``progress_pct`` is current downloader-stage progress, never overall job
+    progress. Merge and upload progress is intentionally stage based.
+    """
     headers = {
         JobStatus.QUEUED: "⏳ Queued",
         JobStatus.CLAIMED: "⏳ Preparing download",
@@ -148,40 +152,53 @@ def build_progress_text(job: DownloadJob) -> str:
             header = failure_headers.get(job.error_category or "", header)
         suffix = "\n\nOriginal streams preserved. No compression or re-encoding." if job.status == JobStatus.COMPLETED else ""
         return f"<b>{header}</b>\n\n{escape(detail or '')}{suffix}"
-    progress_bar_length = 15
-    filled_length = int(round(progress_bar_length * (job.progress_pct / 100.0)))
-    bar = "█" * filled_length + "░" * (progress_bar_length - filled_length)
-
-    speed_mb = job.speed_bytes_sec / (1024 * 1024) if job.speed_bytes_sec else 0.0
-    downloaded_mb = job.downloaded_bytes / (1024 * 1024)
-    total_mb = job.total_bytes / (1024 * 1024) if job.total_bytes else None
-
-    eta_str = f"~{job.eta_seconds}s" if job.eta_seconds is not None else "Unknown"
-
     snapshot = job.video_format_snapshot or {}
     codec = snapshot.get("vcodec_normalized") or "Original source"
     quality = snapshot.get("resolution_label") or "Unknown quality"
     fps = snapshot.get("fps")
     media_line = f"{codec} · {quality}" + (f" · {fps:g} FPS" if isinstance(fps, (int, float)) else "")
-    stage_number = {
-        JobStatus.DOWNLOADING_VIDEO: "Stage 1/3",
-        JobStatus.DOWNLOADING_AUDIO: "Stage 2/3",
-        JobStatus.MERGING: "Stage 2/3",
-        JobStatus.UPLOADING: "Stage 3/3",
-    }.get(job.status, "Preparing")
-    processing_note = (
-        "\nVideo downloaded ✓\nAudio downloaded ✓\nCombining original streams losslessly.\nNo re-encoding is being performed."
-        if job.status == JobStatus.MERGING else ""
-    )
-    text = (
-        f"<b>{header}</b>\n\n"
-        f"{escape(media_line)}\n\n{bar}\n{job.progress_pct:.1f}%\n\n"
-        f"📋 Stage: {escape(job.current_stage)}\n"
-        f"💾 Downloaded: {downloaded_mb:.1f} MB / {f'{total_mb:.1f} MB' if total_mb else 'Unknown'}\n"
-        f"⚡ Speed: {speed_mb:.1f} MB/s\n"
-        f"⏳ ETA: {eta_str}\n\n{stage_number}{processing_note}"
-    )
-    return text
+    lines = [f"<b>{header}</b>", "", escape(media_line), ""]
+    if job.status in {JobStatus.DOWNLOADING_VIDEO, JobStatus.DOWNLOADING_AUDIO}:
+        pct = max(0.0, min(100.0, job.progress_pct))
+        filled = int(round(12 * pct / 100.0))
+        bar = "█" * filled + "░" * (12 - filled)
+        part = "Audio" if job.status == JobStatus.DOWNLOADING_AUDIO else "Video"
+        lines.extend((
+            "Overall: Downloading source streams",
+            f"{bar}  <b>{pct:.1f}%</b> current stage",
+            f"{part}: {pct:.1f}%",
+        ))
+        if job.total_bytes:
+            lines.append(
+                f"Downloaded: {job.downloaded_bytes / 1024**2:.1f} / "
+                f"{job.total_bytes / 1024**2:.1f} MB"
+            )
+        if job.speed_bytes_sec:
+            lines.append(f"Speed: {job.speed_bytes_sec / 1024**2:.1f} MB/s")
+        if job.eta_seconds is not None:
+            lines.append(f"ETA: ~{job.eta_seconds}s")
+    elif job.status == JobStatus.MERGING:
+        lines.extend((
+            "Overall: Final processing",
+            "Download complete ✓",
+            "Combining original streams losslessly.",
+            "No re-encoding is being performed.",
+        ))
+    elif job.status == JobStatus.UPLOADING:
+        lines.extend(("Overall: Final delivery", "Download and processing complete ✓"))
+    elif job.status == JobStatus.WAITING_RESOURCES:
+        stage = (job.current_stage or "").lower()
+        if "merge" in stage:
+            lines.extend(("Overall: Downloads complete • merge pending", "Download complete ✓"))
+        elif "upload" in stage:
+            lines.extend(("Overall: Processing complete • delivery pending", "Download complete ✓"))
+        else:
+            lines.append("Overall: Saved in the persistent queue")
+        lines.append(f"Reason: {escape(job.current_stage or 'Waiting for safe capacity')}")
+        lines.append("No resend required.")
+    else:
+        lines.extend(("Overall: Saved in the persistent queue", escape(job.current_stage)))
+    return "\n".join(lines)
 
 
 def build_progress_keyboard(job_id: str) -> InlineKeyboardMarkup:
@@ -190,6 +207,111 @@ def build_progress_keyboard(job_id: str) -> InlineKeyboardMarkup:
     builder.row(
         InlineKeyboardButton(text="❌ Cancel Download", callback_data=f"cancel_job:{job_id}")
     )
+    return builder.as_markup()
+
+
+def build_error_keyboard(job: DownloadJob) -> InlineKeyboardMarkup:
+    """Offer only safe recovery actions for a categorized terminal failure."""
+    builder = InlineKeyboardBuilder()
+    if job.error_category == "exact_format_disappeared":
+        builder.row(
+            InlineKeyboardButton(text="🔄 Re-analyze", callback_data="home:new"),
+            InlineKeyboardButton(
+                text="🎞 Choose Format",
+                callback_data=f"preferred:{job.media_session_id}",
+            ),
+        )
+    elif job.error_category in {
+        "authentication_required", "drm_unsupported", "site_access_challenge",
+        "media_unavailable", "extraction_timeout",
+    }:
+        builder.row(
+            InlineKeyboardButton(text="🔄 Re-analyze", callback_data="home:new"),
+            InlineKeyboardButton(text="❓ Help", callback_data="home:help"),
+        )
+    elif job.error_category == "telegram_delivery_failed":
+        builder.row(InlineKeyboardButton(text="📋 View Queue", callback_data="queue:mine"))
+    builder.row(InlineKeyboardButton(text="🏠 Home", callback_data="home:show"))
+    return builder.as_markup()
+
+
+def build_home_text(
+    *, active: int, waiting: int, download_target: int, mode: str,
+    max_links: int = 4,
+) -> str:
+    mode_label = {
+        "auto-shared": "Auto Shared",
+        "auto-dedicated": "Auto Dedicated",
+        "manual": "Manual",
+    }.get(mode, mode)
+    return (
+        "👋 <b>Media Downloader</b>\n\n"
+        f"Send one link or up to {max_links} links at once.\n\n"
+        f"⚡ Active     <b>{active}</b>\n"
+        f"⏳ Queued     <b>{waiting}</b>\n"
+        f"🎯 Downloads  <b>{download_target} max</b>\n"
+        f"🛡 Mode       <b>{escape(mode_label)}</b>\n\n"
+        "Original streams • No re-encoding"
+    )
+
+
+def build_home_keyboard(*, is_admin: bool, max_links: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="📥 New Download", callback_data="home:new"),
+        InlineKeyboardButton(text="📋 Queue", callback_data="queue:mine"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="⭐ Formats", callback_data="favorites"),
+        InlineKeyboardButton(text="⚙️ Settings", callback_data="settings"),
+    )
+    builder.row(InlineKeyboardButton(text="❓ Help", callback_data="home:help"))
+    if is_admin:
+        builder.row(InlineKeyboardButton(text="🛠 Control Center", callback_data="admin:status"))
+    return builder.as_markup()
+
+
+def build_queue_text(jobs: list[DownloadJob], positions: dict[str, int]) -> str:
+    active_statuses = {
+        JobStatus.CLAIMED, JobStatus.DOWNLOADING_VIDEO, JobStatus.DOWNLOADING_AUDIO,
+        JobStatus.MERGING, JobStatus.UPLOADING,
+    }
+    active = [job for job in jobs if job.status in active_statuses]
+    waiting = [job for job in jobs if job.status not in active_statuses]
+    lines = ["📋 <b>My Queue</b>", "", "<b>Active</b>"]
+    if not active:
+        lines.append("No active downloads.")
+    for index, job in enumerate(active, 1):
+        quality = (job.video_format_snapshot or {}).get("resolution_label") or job.media_kind.title()
+        stage = job.current_stage or job.status.value.replace("_", " ").title()
+        suffix = (
+            f" • {job.progress_pct:.0f}% current stage"
+            if job.status in {JobStatus.DOWNLOADING_VIDEO, JobStatus.DOWNLOADING_AUDIO}
+            else ""
+        )
+        lines.append(f"{index}. {escape(str(quality))}\n   {escape(stage)}{suffix}")
+    lines.extend(("", "<b>Waiting</b>"))
+    if not waiting:
+        lines.append("No waiting downloads.")
+    for index, job in enumerate(waiting, 1):
+        quality = (job.video_format_snapshot or {}).get("resolution_label") or job.media_kind.title()
+        position = positions.get(job.job_id)
+        reason = job.current_stage if job.status == JobStatus.WAITING_RESOURCES else "Queued"
+        pos = f"Position {position}" if position else "Waiting"
+        lines.append(f"{index}. {escape(str(quality))}\n   {pos} • {escape(reason)}")
+    return "\n".join(lines)
+
+
+def build_queue_keyboard(jobs: list[DownloadJob], *, admin: bool = False) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔄 Refresh", callback_data="queue:mine"))
+    for job in jobs[:8]:
+        builder.row(InlineKeyboardButton(
+            text=f"❌ Cancel {job.job_id[:8]}", callback_data=f"qcancel:{job.job_id}"
+        ))
+    if admin:
+        builder.row(InlineKeyboardButton(text="🌐 All Jobs", callback_data="ops:queue"))
+    builder.row(InlineKeyboardButton(text="🏠 Home", callback_data="home:show"))
     return builder.as_markup()
 
 
@@ -220,12 +342,12 @@ def build_preferred_media_text(
     visible_formats = result.formats[page * page_size:(page + 1) * page_size]
     videos = sum(1 for fmt in session.formats if fmt.is_video)
     lines = [
-        "🎬 <b>Media Found</b>", "",
-        f"<b>Title:</b> {escape(session.title)}",
-        f"<b>Source:</b> {escape(session.extractor)}",
-        f"<b>Duration:</b> {_duration(session.duration)}",
-        f"<b>Video formats discovered:</b> {videos}", "",
-        f"<b>Your preferred formats</b> · Page {page + 1} / {pages}",
+        "🎬 <b>Video ready</b>", "",
+        f"<b>{escape(session.title)}</b>",
+        f"{escape(session.uploader or 'Unknown creator')} • {escape(session.extractor)}",
+        _duration(session.duration),
+        f"Video • {videos} source formats", "",
+        f"⭐ <b>Preferred formats</b> · Page {page + 1} / {pages}",
     ]
     if not result.formats:
         lines.append("No enabled favorite rule has an exact match in this source.")
@@ -333,7 +455,7 @@ def build_format_details_text(
 
 def build_format_details_keyboard(
     session: MediaSession, fmt: MediaFormat, *, back: str = "preferred",
-    manual_audio_required: bool = False,
+    manual_audio_required: bool = False, back_page: int = 0,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="⬇️ Download", callback_data=f"fmt:{session.session_id}:{fmt.internal_key}"))
@@ -342,7 +464,10 @@ def build_format_details_keyboard(
             text="🎵 Choose Audio" if manual_audio_required else "🎵 Audio Options",
             callback_data=f"audopts:{session.session_id}:{fmt.internal_key}",
         ))
-    back_data = f"preferred:{session.session_id}" if back == "preferred" else f"all:{session.session_id}:0"
+    back_data = (
+        f"preferred:{session.session_id}" if back == "preferred"
+        else f"all:{session.session_id}:{max(0, back_page)}"
+    )
     builder.row(InlineKeyboardButton(text="🔙 Back", callback_data=back_data))
     return builder.as_markup()
 
@@ -376,7 +501,8 @@ def build_all_formats_keyboard(
     builder = InlineKeyboardBuilder()
     for fmt in values[page * page_size:(page + 1) * page_size]:
         builder.row(InlineKeyboardButton(
-            text=format_button_label(fmt), callback_data=f"adetail:{session.session_id}:{fmt.internal_key}"
+            text=format_button_label(fmt),
+            callback_data=f"adetail:{session.session_id}:{fmt.internal_key}:{page}",
         ))
     builder.row(
         InlineKeyboardButton(text="Codec", callback_data=f"filter:{session.session_id}:codec"),
@@ -399,6 +525,39 @@ def build_all_formats_keyboard(
     return builder.as_markup()
 
 
+def build_all_formats_text(
+    session: MediaSession, filters: dict[str, object], page: int = 0,
+    page_size: int = 6,
+) -> str:
+    values = filtered_video_formats(session, filters)
+    pages = max(1, math.ceil(len(values) / page_size))
+    page = max(0, min(page, pages - 1))
+    video_count = sum(1 for fmt in session.formats if fmt.is_video)
+    audio_count = sum(1 for fmt in session.formats if fmt.is_audio and not fmt.is_video)
+
+    def selected(name: str) -> str:
+        value = filters.get(name) or ["any"]
+        if isinstance(value, list):
+            return ", ".join(str(item) for item in value).title()
+        return str(value)
+
+    lines = [
+        "🔍 <b>All Source Formats</b>", "",
+        f"Page {page + 1} / {pages}",
+        f"{video_count} video • {audio_count} audio", "",
+        "<b>Current filters</b>",
+        f"Codec: {escape(selected('codec'))}",
+        f"Resolution: {escape(selected('resolution'))}",
+        f"FPS: {escape(selected('fps'))}",
+        f"Container: {escape(selected('container'))}",
+    ]
+    query = str(filters.get("query") or "").strip()
+    if query:
+        lines.append(f"Search: {escape(query)}")
+    lines.extend(("", f"Showing {len(values)} matching genuine video formats."))
+    return "\n".join(lines)
+
+
 def build_filter_keyboard(session_id: str, category: str, selected: list[str]) -> InlineKeyboardMarkup:
     choices = {
         "codec": ["any", "h265", "h264", "vp9", "av1", "other"],
@@ -407,9 +566,14 @@ def build_filter_keyboard(session_id: str, category: str, selected: list[str]) -
         "container": ["any", "mp4", "webm", "mkv-compatible", "other"],
     }[category]
     builder = InlineKeyboardBuilder()
+    category_token = {
+        "codec": "c", "resolution": "r", "fps": "f", "container": "e",
+    }[category]
     for value in choices:
         mark = "☑" if value in selected else "☐"
-        builder.button(text=f"{mark} {value}", callback_data=f"ftoggle:{session_id}:{category}:{value}")
+        builder.button(
+            text=f"{mark} {value}", callback_data=f"ft:{session_id}:{category_token}:{value}"
+        )
     builder.adjust(2)
     builder.row(InlineKeyboardButton(text="✅ Apply", callback_data=f"all:{session_id}:0"))
     return builder.as_markup()
@@ -445,31 +609,75 @@ def build_settings_keyboard(
     settings: UserSettings, media_session_id: str | None = None
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    def setting_callback(category: str, value: str) -> str:
-        base = f"set:{category}:{value}"
-        return f"{base}:{media_session_id}" if media_session_id else base
     builder.row(
-        InlineKeyboardButton(text=("● Video" if settings.send_mode == "video" else "○ Video"), callback_data=setting_callback("send", "video")),
-        InlineKeyboardButton(text=("● Document" if settings.send_mode == "document" else "○ Document"), callback_data=setting_callback("send", "document")),
+        InlineKeyboardButton(
+            text="📦 Delivery", callback_data="uset:delivery" + (f":{media_session_id}" if media_session_id else "")
+        ),
+        InlineKeyboardButton(text="⭐ Favorite Formats", callback_data="favorites"),
     )
-    builder.row(InlineKeyboardButton(text="⭐ Favorite Formats", callback_data="favorites"))
-    for value, label in (("best_quality", "Best quality"), ("smallest_file", "Smallest file"), ("prefer_ready", "Prefer ready/muxed")):
-        builder.row(InlineKeyboardButton(
-            text=("● " if settings.matching_strategy.value == value else "○ ") + label,
-            callback_data=setting_callback("strategy", value),
-        ))
     builder.row(
-        InlineKeyboardButton(text=("● Rich" if settings.detail_style.value == "rich" else "○ Rich"), callback_data=setting_callback("detail", "rich")),
-        InlineKeyboardButton(text=("● Compact" if settings.detail_style.value == "compact" else "○ Compact"), callback_data=setting_callback("detail", "compact")),
+        InlineKeyboardButton(
+            text="🎵 Audio", callback_data="uset:audio" + (f":{media_session_id}" if media_session_id else "")
+        ),
+        InlineKeyboardButton(
+            text="🎯 Workflow", callback_data="uset:workflow" + (f":{media_session_id}" if media_session_id else "")
+        ),
     )
-    builder.row(InlineKeyboardButton(
-        text=("● Automatic audio" if settings.automatic_audio else "○ Automatic audio"),
-        callback_data=setting_callback("auto_audio", "toggle"),
-    ))
     if media_session_id:
         builder.row(InlineKeyboardButton(
             text="🔙 Back to Media", callback_data=f"preferred:{media_session_id}:0"
         ))
+    else:
+        builder.row(InlineKeyboardButton(text="🏠 Home", callback_data="home:show"))
+    return builder.as_markup()
+
+
+def build_settings_section_keyboard(
+    settings: UserSettings, section: str, media_session_id: str | None = None,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+
+    def setting_callback(category: str, value: str) -> str:
+        base = f"set:{category}:{value}"
+        return f"{base}:{media_session_id}" if media_session_id else base
+
+    if section == "delivery":
+        builder.row(
+            InlineKeyboardButton(
+                text=("● Send as Video" if settings.send_mode == "video" else "○ Send as Video"),
+                callback_data=setting_callback("send", "video"),
+            ),
+            InlineKeyboardButton(
+                text=("● Send as File" if settings.send_mode == "document" else "○ Send as File"),
+                callback_data=setting_callback("send", "document"),
+            ),
+        )
+    elif section == "audio":
+        builder.row(InlineKeyboardButton(
+            text=("● Automatic source audio" if settings.automatic_audio else "○ Choose audio manually"),
+            callback_data=setting_callback("auto_audio", "toggle"),
+        ))
+    else:
+        for value, label in (
+            ("best_quality", "Best quality"), ("smallest_file", "Smallest file"),
+            ("prefer_ready", "Prefer ready/muxed"),
+        ):
+            builder.row(InlineKeyboardButton(
+                text=("● " if settings.matching_strategy.value == value else "○ ") + label,
+                callback_data=setting_callback("strategy", value),
+            ))
+        builder.row(
+            InlineKeyboardButton(
+                text=("● Rich details" if settings.detail_style.value == "rich" else "○ Rich details"),
+                callback_data=setting_callback("detail", "rich"),
+            ),
+            InlineKeyboardButton(
+                text=("● Compact" if settings.detail_style.value == "compact" else "○ Compact"),
+                callback_data=setting_callback("detail", "compact"),
+            ),
+        )
+    back = "settings" + (f":{media_session_id}" if media_session_id else "")
+    builder.row(InlineKeyboardButton(text="↩️ Settings", callback_data=back))
     return builder.as_markup()
 
 
@@ -556,6 +764,16 @@ def build_collection_text(session: MediaSession) -> str:
         "📚 <b>Multi-media Post</b>" if session.session_kind == "multimedia" else
         "📚 <b>Playlist Detected</b>"
     )
+    if session.session_kind == "batch":
+        status_icons = {
+            "ready": "✅ Ready", "analyzing": "🔎 Analyzing",
+            "waiting": "⏳ Waiting for analysis", "failed": "❌ Failed",
+        }
+        lines = ["📥 <b>Batch received</b>", "", f"{len(session.items)} links", ""]
+        for index, item in enumerate(session.items, 1):
+            state = status_icons.get(item.analysis_status, "⏳ Waiting")
+            lines.extend((f"{index}. {escape(item.title)}", f"   {state}"))
+        return "\n".join(lines)
     lines = [title, "", f"<b>Title:</b> {escape(session.title)}", f"Items loaded: {len(session.items)}"]
     if session.collection_truncated:
         lines.append("The collection was capped at the configured safe browse limit.")
@@ -588,9 +806,13 @@ def build_collection_keyboard(session: MediaSession, page: int = 0) -> InlineKey
             InlineKeyboardButton(text="First 10", callback_data=f"items:{session.session_id}:10"),
         )
     builder.row(InlineKeyboardButton(
-        text="🔗 Process Individually" if session.session_kind == "batch" else "☑ Select Items",
+        text="🔎 Review Items" if session.session_kind == "batch" else "☑ Select Items",
         callback_data=f"iselect:{session.session_id}",
     ))
+    if session.session_kind == "batch" and any(item.analysis_status == "ready" for item in session.items):
+        builder.row(InlineKeyboardButton(
+            text="⬇️ Download Ready", callback_data=f"allmedia:{session.session_id}"
+        ))
     if session.session_kind == "multimedia":
         builder.row(InlineKeyboardButton(
             text="📦 Download All Media", callback_data=f"allmedia:{session.session_id}"
@@ -660,7 +882,7 @@ def build_admin_status_text(
     cpu = sample["cpu"]
     memory = sample["memory"]
     return (
-        "🖥 <b>Server</b>\n\n"
+        "🛠 <b>Bot Control Center</b>\n\n"
         f"CPU: {float(cpu['load_percent']):.0f}%\n"
         f"Memory available: {int(memory['available']) / 1024**3:.2f} GB\n"
         f"Disk free: {disk_free / 1024**3:.2f} GB\n\n"
@@ -678,19 +900,101 @@ def build_admin_status_text(
 
 def build_admin_keyboard(paused: bool) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="⚡ Performance", callback_data="admin:performance"),
+        InlineKeyboardButton(text="📋 Queue", callback_data="ops:queue"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🛡 Resource Mode", callback_data="admin:resources"),
+        InlineKeyboardButton(text="👥 Users", callback_data="admin:users"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔐 Sessions", callback_data="ops:sessions"),
+        InlineKeyboardButton(text="🧹 Maintenance", callback_data="admin:maintenance"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📊 Diagnostics", callback_data="ops:status"),
+        InlineKeyboardButton(text="⚙️ Bot Settings", callback_data="admin:performance"),
+    )
     builder.row(InlineKeyboardButton(
         text="▶️ Resume New Jobs" if paused else "⏸ Pause New Jobs",
         callback_data="admin:resume" if paused else "admin:pause",
     ))
-    builder.row(
-        InlineKeyboardButton(text="👥 Users", callback_data="admin:users"),
-        InlineKeyboardButton(text="⚙️ Resources", callback_data="admin:resources"),
+    return builder.as_markup()
+
+
+def build_performance_text(
+    values: dict[str, object], effective: dict[str, int], active: dict[str, int],
+    reason: str,
+) -> str:
+    return (
+        "⚡ <b>Performance</b>\n\n"
+        f"Links per message: <b>{values['max_batch_urls']}</b>\n\n"
+        f"Downloads\nTarget: <b>{values['max_concurrent_downloads']}</b>\n"
+        f"Currently allowed: <b>{effective['download']}</b> · Active: {active['download']}\n\n"
+        f"Extraction\nTarget: <b>{values['max_concurrent_extractions']}</b>\n"
+        f"Currently allowed: <b>{effective['extraction']}</b> · Active: {active['extraction']}\n\n"
+        f"Merges\nTarget: <b>{values['max_concurrent_merges']}</b>\n"
+        f"Currently allowed: <b>{effective['merge']}</b> · Active: {active['merge']}\n\n"
+        f"Uploads\nTarget: <b>{values['max_concurrent_uploads']}</b>\n"
+        f"Currently allowed: <b>{effective['upload']}</b> · Active: {active['upload']}\n\n"
+        f"Reason: {escape(reason)}"
     )
-    builder.row(InlineKeyboardButton(text="🩺 Diagnostics", callback_data="ops:status"),
-                InlineKeyboardButton(text="📋 Queue", callback_data="ops:queue"))
-    builder.row(InlineKeyboardButton(text="🔐 Authorized Sessions", callback_data="ops:sessions"))
-    builder.row(InlineKeyboardButton(text="🧹 Maintenance", callback_data="ops:cleanup"),
-                InlineKeyboardButton(text="💾 Database backup", callback_data="ops:backup"))
+
+
+def build_performance_keyboard(values: dict[str, object]) -> InlineKeyboardMarkup:
+    aliases = {
+        "max_batch_urls": "batch", "max_concurrent_downloads": "down",
+        "max_concurrent_extractions": "extract", "max_concurrent_merges": "merge",
+        "max_concurrent_uploads": "upload",
+    }
+    labels = {
+        "max_batch_urls": "Links", "max_concurrent_downloads": "Download",
+        "max_concurrent_extractions": "Extraction", "max_concurrent_merges": "Merge",
+        "max_concurrent_uploads": "Upload",
+    }
+    builder = InlineKeyboardBuilder()
+    for key, alias in aliases.items():
+        builder.row(
+            InlineKeyboardButton(text=f"{labels[key]} −", callback_data=f"perf:{alias}:-1"),
+            InlineKeyboardButton(text=str(values[key]), callback_data="noop"),
+            InlineKeyboardButton(text=f"{labels[key]} +", callback_data=f"perf:{alias}:1"),
+            InlineKeyboardButton(text="↺", callback_data=f"perfreset:{alias}"),
+        )
+    builder.row(InlineKeyboardButton(text="Advanced", callback_data="perfadvanced:show"))
+    builder.row(InlineKeyboardButton(text="↩️ Back", callback_data="admin:status"))
+    return builder.as_markup()
+
+
+def build_performance_advanced_text(values: dict[str, object]) -> str:
+    bandwidth = int(values["bandwidth_ceiling"])
+    bandwidth_text = "Unlimited" if bandwidth == 0 else f"{bandwidth / 1024**2:g} MiB/s per download"
+    return (
+        "⚡ <b>Advanced Performance</b>\n\n"
+        f"Per-user active/queued limit: <b>{values['max_queued_jobs_per_user']}</b>\n"
+        f"Global active/queued limit: <b>{values['max_total_queued_jobs']}</b>\n"
+        f"Bandwidth ceiling: <b>{bandwidth_text}</b>\n\n"
+        "Changes apply to new admission/processes. Healthy active work is not killed."
+    )
+
+
+def build_performance_advanced_keyboard(values: dict[str, object]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for label, alias, key in (
+        ("User queue", "userq", "max_queued_jobs_per_user"),
+        ("Global queue", "globalq", "max_total_queued_jobs"),
+        ("Bandwidth", "bw", "bandwidth_ceiling"),
+    ):
+        shown = values[key]
+        if key == "bandwidth_ceiling":
+            shown = "∞" if int(shown) == 0 else f"{int(shown) // 1024**2}M"
+        builder.row(
+            InlineKeyboardButton(text=f"{label} −", callback_data=f"perf:{alias}:-1"),
+            InlineKeyboardButton(text=str(shown), callback_data="noop"),
+            InlineKeyboardButton(text=f"{label} +", callback_data=f"perf:{alias}:1"),
+            InlineKeyboardButton(text="↺", callback_data=f"perfreset:{alias}"),
+        )
+    builder.row(InlineKeyboardButton(text="↩️ Performance", callback_data="admin:performance"))
     return builder.as_markup()
 
 

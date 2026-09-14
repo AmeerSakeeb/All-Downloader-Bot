@@ -4,12 +4,14 @@ import asyncio
 import logging
 import uuid
 from html import escape
+from urllib.parse import urlsplit
 from aiogram import Router, F
 from aiogram.types import Message
 
 from core.exceptions import BotError, ExtractionError, SecurityError
 from core.models import MediaItem, MediaSession
 from extractors.registry import ExtractorRegistry
+from jobqueue.scheduler import JobScheduler
 from security.ssrf import SSRFGuard
 from security.url_logging import sanitize_url_for_log
 from resources.governor import ResourceGovernor
@@ -45,10 +47,84 @@ def extract_urls_from_text(text: str) -> list[str]:
     return values
 
 
+async def _wait_for_extraction_lease(
+    governor: ResourceGovernor, db: Database, user_id: int
+):
+    """Wait fairly for adaptive capacity without asking the user to resend."""
+    while True:
+        lease, reason = await governor.acquire_stage("extraction")
+        if lease is not None:
+            return lease
+        user = await db.get_user(user_id)
+        if not user or not user["is_allowed"]:
+            return None
+        await asyncio.sleep(max(1.0, min(10.0, governor.settings.scheduler_retry_seconds)))
+
+
+def _platform_label(url: str) -> str:
+    host = (urlsplit(url).hostname or "Media").lower()
+    host = host.removeprefix("www.")
+    return host.split(".")[0].replace("-", " ").title() or "Media"
+
+
+async def _analyze_batch(
+    *, session: MediaSession, message: Message, status_msg, db: Database,
+    governor: ResourceGovernor, extractor_registry: ExtractorRegistry,
+) -> None:
+    update_lock = asyncio.Lock()
+
+    async def publish() -> None:
+        async with update_lock:
+            await db.save_media_session(session)
+            try:
+                await status_msg.edit_text(
+                    build_collection_text(session),
+                    reply_markup=build_collection_keyboard(session),
+                )
+            except Exception:
+                logger.debug("Batch status edit was rejected or unchanged", exc_info=True)
+
+    async def analyze(item: MediaItem) -> None:
+        item.analysis_status = "analyzing"
+        await publish()
+        try:
+            lease = await _wait_for_extraction_lease(
+                governor, db, message.from_user.id
+            )
+            if lease is None:
+                item.analysis_status = "failed"
+                item.analysis_error_category = "access_revoked"
+                return
+            async with lease:
+                extractor = await extractor_registry.get_extractor_for_url(item.source_url)
+                child = await extractor.extract(
+                    item.source_url,
+                    message.from_user.id,
+                    operation_id=f"batch-{session.session_id}-{item.item_id}",
+                )
+            item.title = child.title or item.title
+            item.formats = child.formats
+            item.thumbnail_url = child.thumbnail_url
+            item.extractor_id = child.media_id
+            item.source_extractor = child.extractor
+            item.analysis_status = "ready"
+        except BotError as error:
+            item.analysis_status = "failed"
+            item.analysis_error_category = getattr(error, "error_category", "media_unavailable")
+        except Exception:
+            logger.exception("Batch child analysis failed")
+            item.analysis_status = "failed"
+            item.analysis_error_category = "unexpected_error"
+        finally:
+            await publish()
+
+    await asyncio.gather(*(analyze(item) for item in session.items))
+
+
 @router.message(F.text)
 async def handle_potential_url(
     message: Message, db: Database, governor: ResourceGovernor,
-    extractor_registry: ExtractorRegistry,
+    extractor_registry: ExtractorRegistry, scheduler: JobScheduler,
 ):
     """Processes incoming messages to see if they contain valid, authorized media URLs."""
     if message.from_user is None:
@@ -56,29 +132,61 @@ async def handle_potential_url(
     text = message.text or ""
     urls = extract_urls_from_text(text)
     if not urls:
-        draft = await db.get_ui_draft(message.from_user.id, "format-search")
+        pending_search = await db.get_latest_ui_draft(
+            message.from_user.id, "format_search:"
+        )
+        search_key, draft = pending_search if pending_search else ("", None)
         if draft and draft.get("kind") == "format_search":
             session = await db.get_media_session(str(draft.get("session_id") or ""))
             if session and session.user_id == message.from_user.id and not session.is_expired():
-                draft_key = f"filters:{session.session_id}"
+                draft_key = f"format_filters:{session.session_id}"
                 filter_draft = await db.get_ui_draft(message.from_user.id, draft_key)
                 filters = dict((filter_draft or {}).get("filters") or {})
                 filters["query"] = text.strip()[:80]
                 await db.save_ui_draft(message.from_user.id, draft_key, {
                     "kind": "filters", "session_id": session.session_id, "filters": filters,
                 })
-                await db.delete_ui_draft(message.from_user.id, "format-search")
+                await db.delete_ui_draft(message.from_user.id, search_key)
                 await message.reply(
                     f"🔎 <b>Format search:</b> {escape(filters['query'])}",
                     reply_markup=build_all_formats_keyboard(session, filters, 0),
                 )
         return
 
+    if scheduler.paused:
+        await message.reply(
+            "⏸ <b>New downloads are paused</b>\n\n"
+            "The administrator has temporarily paused admission."
+        )
+        return
+    user_active = await db.count_active_jobs_for_user(message.from_user.id)
+    total_active = await db.count_total_active_jobs()
+    if user_active >= governor.settings.max_queued_jobs_per_user:
+        await message.reply(
+            "📋 <b>Queue full</b>\n\nYour link was not accepted.\n\n"
+            f"Current: {user_active} / {governor.settings.max_queued_jobs_per_user} "
+            "active or queued for your account."
+        )
+        return
+    if total_active >= governor.settings.max_total_queued_jobs:
+        await message.reply(
+            "📋 <b>Queue full</b>\n\nYour link was not accepted because the global queue is full."
+        )
+        return
+    if governor.file_mgr.get_free_disk_space() <= governor.disk_safety_bytes():
+        await message.reply(
+            "💾 <b>Storage safety pause</b>\n\n"
+            "Your link was not accepted while protected disk headroom is unavailable."
+        )
+        return
+
     # 1. SSRF Validation Gate 1
     try:
         if len(urls) > governor.settings.max_batch_urls:
             await message.reply(
-                f"⚠️ This message contains too many URLs. The safe batch limit is {governor.settings.max_batch_urls}."
+                f"⚠️ <b>Too many links</b>\n\n"
+                f"{governor.settings.max_batch_urls} links can be submitted at once. "
+                f"You sent {len(urls)}.\n\nNo links were discarded or submitted."
             )
             return
         for candidate in urls:
@@ -99,15 +207,31 @@ async def handle_potential_url(
             extractor="batch",
             title=f"{len(urls)} URLs found",
             session_kind="batch",
-            items=[MediaItem(kind="url", source_url=value, title=f"URL {index}") for index, value in enumerate(urls, 1)],
+            items=[MediaItem(
+                kind="video", source_url=value, title=_platform_label(value),
+                analysis_status="waiting",
+            ) for value in urls],
         )
         await db.save_media_session(session)
-        await message.reply(
+        status_msg = await message.reply(
             build_collection_text(session), reply_markup=build_collection_keyboard(session)
+        )
+        await _analyze_batch(
+            session=session, message=message, status_msg=status_msg, db=db,
+            governor=governor, extractor_registry=extractor_registry,
         )
         return
 
     url = urls[0]
+
+    # Persist admission before waiting so temporary pressure never loses the
+    # accepted request or requires a resend.
+    pending = MediaSession.with_ttl(
+        ttl_seconds=governor.settings.media_session_ttl,
+        user_id=message.from_user.id, url=url, canonical_url=url,
+        extractor="pending", title=_platform_label(url), formats=[],
+    )
+    await db.save_media_session(pending)
 
     # Notify user extraction has begun
     status_msg = await message.reply("🔍 <b>Analyzing link…</b>\n\nExtracting available formats.")
@@ -116,16 +240,14 @@ async def handle_potential_url(
         lease, reason = await governor.acquire_stage("extraction")
         if not lease:
             await status_msg.edit_text(
-                "⏳ Waiting briefly for extraction resources. Analysis will resume automatically."
+                "⏳ <b>Waiting for resources</b>\n\n"
+                "Your link is saved and analysis will start automatically.\nNo resend required."
             )
-            deadline = asyncio.get_running_loop().time() + 30.0
-            while lease is None and asyncio.get_running_loop().time() < deadline:
-                await asyncio.sleep(min(2.0, max(0, deadline - asyncio.get_running_loop().time())))
-                lease, reason = await governor.acquire_stage("extraction")
+            lease = await _wait_for_extraction_lease(
+                governor, db, message.from_user.id
+            )
         if lease is None:
-            await status_msg.edit_text(
-                "The server is busy. Please resend the link in a little while."
-            )
+            await status_msg.edit_text("Access denied.")
             return
         async with lease:
             # Access may have been revoked during the bounded resource wait.
@@ -139,6 +261,7 @@ async def handle_potential_url(
                 message.from_user.id,
                 operation_id=f"analysis-{uuid.uuid4().hex}",
             )
+            session.session_id = pending.session_id
         
         # 4. Save session to SQLite
         await db.save_media_session(session)

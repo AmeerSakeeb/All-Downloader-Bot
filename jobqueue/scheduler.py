@@ -275,42 +275,45 @@ class JobScheduler:
                 if streams.audio is None:
                     raise RuntimeError("Companion audio path was not retained")
                 await self._raise_if_cancelled(job_id)
-                lease, reason = await self.governor.acquire_stage("merge")
-                if not lease:
-                    await self._set_status(
-                        job, JobStatus.WAITING_RESOURCES, f"Waiting for merge: {reason}"
-                    )
-                    return
-                async with lease:
-                    actual_inputs = streams.primary.stat().st_size + streams.audio.stat().st_size
-                    current_usage = self.file_mgr.job_disk_usage(job.job_id)
-                    merge_projection = current_usage + int(actual_inputs * 1.1)
-                    if not await self.governor.reserve_job_disk(
-                        job.job_id, merge_projection
-                    ):
-                        raise InsufficientDiskSpaceError(
-                            merge_projection, self.file_mgr.get_free_disk_space()
+                merged_name = f"merged_output.{safe_extension(video.ext, 'mkv')}"
+                existing_merge = self.file_mgr.find_job_file(job.job_id, merged_name)
+                if existing_merge is not None:
+                    final_path = existing_merge
+                else:
+                    lease, reason = await self.governor.acquire_stage("merge")
+                    if not lease:
+                        await self._set_status(
+                            job, JobStatus.WAITING_RESOURCES, f"Waiting for merge: {reason}"
                         )
-                    await self._set_status(
-                        job, JobStatus.MERGING, "Combining streams losslessly"
-                    )
-
-                    async def merge_growth_check() -> None:
-                        actual = self.file_mgr.job_disk_usage(job.job_id)
-                        if not await self.governor.growth_is_safe(job.job_id, actual):
+                        return
+                    async with lease:
+                        actual_inputs = streams.primary.stat().st_size + streams.audio.stat().st_size
+                        current_usage = self.file_mgr.job_disk_usage(job.job_id)
+                        merge_projection = current_usage + int(actual_inputs * 1.1)
+                        if not await self.governor.reserve_job_disk(
+                            job.job_id, merge_projection
+                        ):
                             raise InsufficientDiskSpaceError(
-                                actual, self.file_mgr.get_free_disk_space()
+                                merge_projection, self.file_mgr.get_free_disk_space()
                             )
+                        await self._set_status(
+                            job, JobStatus.MERGING, "Combining streams losslessly"
+                        )
 
-                    final_path = await self.ffmpeg_mgr.merge_streams(
-                        streams.primary,
-                        streams.audio,
-                        self.file_mgr.get_job_file_path(
-                            job.job_id, f"merged_output.{safe_extension(video.ext, 'mkv')}"
-                        ),
-                        job_id=job.job_id,
-                        growth_check=merge_growth_check,
-                    )
+                        async def merge_growth_check() -> None:
+                            actual = self.file_mgr.job_disk_usage(job.job_id)
+                            if not await self.governor.growth_is_safe(job.job_id, actual):
+                                raise InsufficientDiskSpaceError(
+                                    actual, self.file_mgr.get_free_disk_space()
+                                )
+
+                        final_path = await self.ffmpeg_mgr.merge_streams(
+                            streams.primary,
+                            streams.audio,
+                            self.file_mgr.get_job_file_path(job.job_id, merged_name),
+                            job_id=job.job_id,
+                            growth_check=merge_growth_check,
+                        )
 
             await self._raise_if_cancelled(job_id)
             if self.telegram_service:
@@ -445,6 +448,11 @@ class JobScheduler:
             job.job_id, audio_name
         )
         if audio_path is None:
+            job.progress_pct = 0.0
+            job.downloaded_bytes = 0
+            job.total_bytes = audio.effective_size
+            job.speed_bytes_sec = 0.0
+            job.eta_seconds = None
             await self._set_status(job, JobStatus.DOWNLOADING_AUDIO, "Downloading audio")
             audio_path = await self.downloader.download_format(
                 job.job_id,

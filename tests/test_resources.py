@@ -68,6 +68,18 @@ async def test_stage_admission_denial(db, settings):
     await first.release()
 
 
+@pytest.mark.asyncio
+async def test_configured_download_target_two_allows_two_when_healthy(db, settings):
+    settings.max_concurrent_downloads = 2
+    governor = ResourceGovernor(db, FileManager(settings.jobs_dir), settings, Detector)
+    first, _ = await governor.acquire_stage("download")
+    second, _ = await governor.acquire_stage("download")
+    third, _ = await governor.acquire_stage("download")
+    assert first is not None and second is not None and third is None
+    await first.release()
+    await second.release()
+
+
 def test_cgroup_memory_limit(monkeypatch):
     class Memory:
         total = 16_000

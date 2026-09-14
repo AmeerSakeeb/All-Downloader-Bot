@@ -16,7 +16,7 @@ from core.models import (
     MediaFormat, MediaSession, UserSettings,
 )
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 ACTIVE_STATUSES = tuple(
     status.value
     for status in (
@@ -95,6 +95,7 @@ class Database:
             7: self._migration_v7,
             8: self._migration_v8,
             9: self._migration_v9,
+            10: self._migration_v10,
         }
         for version in range(current + 1, CURRENT_SCHEMA_VERSION + 1):
             await db.execute("BEGIN IMMEDIATE")
@@ -421,6 +422,17 @@ class Database:
         await self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_cache_execution "
             "ON telegram_file_cache(execution_identity,last_used_at)"
+        )
+
+    async def _migration_v10(self) -> None:
+        """Typed runtime overrides; validation remains in RuntimeSettingsService."""
+        await self.connection.execute(
+            """CREATE TABLE IF NOT EXISTS runtime_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                updated_by INTEGER
+            )"""
         )
 
     async def schema_version(self) -> int:
@@ -846,6 +858,61 @@ class Database:
         ).fetchall()
         return [self._job_from_row(row) for row in rows]
 
+    async def get_active_jobs_for_user(self, user_id: int) -> list[DownloadJob]:
+        """Return jobs for which this user still has a waiting delivery."""
+        marks = ",".join("?" for _ in ACTIVE_STATUSES)
+        rows = await (
+            await self.connection.execute(
+                f"""SELECT j.* FROM download_jobs AS j
+                    WHERE j.status IN ({marks}) AND (
+                        EXISTS (SELECT 1 FROM job_subscribers AS s
+                                WHERE s.job_id=j.job_id AND s.user_id=?
+                                  AND s.status='waiting')
+                        OR (j.user_id=? AND NOT EXISTS (
+                            SELECT 1 FROM job_subscribers AS any_s
+                            WHERE any_s.job_id=j.job_id
+                        ))
+                    ) ORDER BY j.created_at""",
+                (*ACTIVE_STATUSES, int(user_id), int(user_id)),
+            )
+        ).fetchall()
+        return [self._job_from_row(row) for row in rows]
+
+    async def queue_position(self, job_id: str) -> Optional[int]:
+        job = await self.get_job(job_id)
+        if not job or job.status not in {JobStatus.QUEUED, JobStatus.WAITING_RESOURCES}:
+            return None
+        row = await (
+            await self.connection.execute(
+                """SELECT COUNT(*) AS ahead FROM download_jobs
+                   WHERE status IN (?,?) AND
+                         (updated_at<? OR (updated_at=? AND created_at<?))""",
+                (
+                    JobStatus.QUEUED.value, JobStatus.WAITING_RESOURCES.value,
+                    job.updated_at, job.updated_at, job.created_at,
+                ),
+            )
+        ).fetchone()
+        return int(row["ahead"]) + 1 if row else 1
+
+    async def cancel_all_waiting_jobs(self) -> int:
+        now = time.time()
+        cursor = await self.connection.execute(
+            """UPDATE download_jobs SET status=?,current_stage='Cancelled by administrator',
+               claimed_at=NULL,updated_at=? WHERE status IN (?,?)""",
+            (
+                JobStatus.CANCELLED.value, now, JobStatus.QUEUED.value,
+                JobStatus.WAITING_RESOURCES.value,
+            ),
+        )
+        await self.connection.execute(
+            """UPDATE job_subscribers SET status='cancelled'
+               WHERE status='waiting' AND job_id IN
+               (SELECT job_id FROM download_jobs WHERE status=?)""",
+            (JobStatus.CANCELLED.value,),
+        )
+        return cursor.rowcount
+
     async def claim_job(self, job_id: str) -> bool:
         now = time.time()
         cursor = await self.connection.execute(
@@ -1184,6 +1251,24 @@ class Database:
         ).fetchone()
         return json.loads(row["draft_json"]) if row else None
 
+    async def get_latest_ui_draft(
+        self, user_id: int, key_prefix: str
+    ) -> Optional[tuple[str, dict[str, Any]]]:
+        row = await (
+            await self.connection.execute(
+                """SELECT draft_key,draft_json FROM ui_drafts
+                   WHERE user_id=? AND draft_key LIKE ? AND updated_at>?
+                   ORDER BY updated_at DESC LIMIT 1""",
+                (
+                    int(user_id), key_prefix + "%",
+                    time.time() - self.ui_draft_ttl_seconds,
+                ),
+            )
+        ).fetchone()
+        if not row:
+            return None
+        return str(row["draft_key"]), json.loads(row["draft_json"])
+
     async def delete_ui_draft(self, user_id: int, draft_key: str) -> None:
         await self.connection.execute(
             "DELETE FROM ui_drafts WHERE user_id=? AND draft_key=?",
@@ -1502,6 +1587,30 @@ class Database:
             )
         ).fetchone()
         return str(row["setting_value"]) if row else None
+
+    async def set_runtime_setting(
+        self, key: str, value: str, updated_by: Optional[int] = None
+    ) -> None:
+        await self.connection.execute(
+            """INSERT INTO runtime_settings(setting_key,setting_value,updated_at,updated_by)
+               VALUES(?,?,?,?) ON CONFLICT(setting_key) DO UPDATE SET
+               setting_value=excluded.setting_value,updated_at=excluded.updated_at,
+               updated_by=excluded.updated_by""",
+            (key, value, time.time(), updated_by),
+        )
+
+    async def delete_runtime_setting(self, key: str) -> None:
+        await self.connection.execute(
+            "DELETE FROM runtime_settings WHERE setting_key=?", (key,)
+        )
+
+    async def list_runtime_settings(self) -> dict[str, str]:
+        rows = await (
+            await self.connection.execute(
+                "SELECT setting_key,setting_value FROM runtime_settings"
+            )
+        ).fetchall()
+        return {str(row["setting_key"]): str(row["setting_value"]) for row in rows}
 
     async def phase2_stats(self) -> dict[str, int]:
         result: dict[str, int] = {}

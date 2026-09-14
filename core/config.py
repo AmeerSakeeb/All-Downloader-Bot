@@ -66,12 +66,14 @@ class Settings(BaseSettings):
     disk_safety_headroom_gb: float = Field(default=0.0, ge=0.0)
     disk_safety_headroom_fraction: float = Field(default=0.08, ge=0.01, le=0.5)
     cpu_safety_headroom: float = Field(default=0.1, ge=0.0, le=0.5)
-    max_concurrent_extractions: int = Field(default=0, ge=0)
-    max_concurrent_downloads: int = Field(default=0, ge=0)
-    max_concurrent_merges: int = Field(default=0, ge=0)
-    max_concurrent_uploads: int = Field(default=0, ge=0)
+    # Operational bootstrap defaults. SQLite runtime overrides become
+    # authoritative after an administrator changes them through Telegram.
+    max_concurrent_extractions: int = Field(default=2, ge=0, le=4)
+    max_concurrent_downloads: int = Field(default=2, ge=0, le=4)
+    max_concurrent_merges: int = Field(default=1, ge=0, le=2)
+    max_concurrent_uploads: int = Field(default=1, ge=0, le=3)
     bandwidth_ceiling: int = Field(default=0, ge=0)
-    max_queued_jobs_per_user: int = Field(default=3, ge=1, le=50)
+    max_queued_jobs_per_user: int = Field(default=6, ge=1, le=50)
     max_total_queued_jobs: int = Field(default=50, ge=1, le=1000)
 
     # Storage Configuration
@@ -101,7 +103,7 @@ class Settings(BaseSettings):
     backup_retention_count: int = Field(default=5, ge=1, le=50)
     media_session_ttl: int = Field(default=1800, ge=60)
     max_collection_items: int = Field(default=50, ge=1, le=200)
-    max_batch_urls: int = Field(default=10, ge=1, le=25)
+    max_batch_urls: int = Field(default=4, ge=1, le=10)
 
     @field_validator("ytdlp_cookies_file", "ytdlp_profiles_file", mode="before")
     @classmethod

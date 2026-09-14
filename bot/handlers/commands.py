@@ -11,7 +11,8 @@ from jobqueue.scheduler import JobScheduler
 from resources.governor import ResourceGovernor
 from ui.builders import (
     build_admin_keyboard, build_admin_status_text, build_settings_keyboard,
-    build_settings_text,
+    build_settings_text, build_home_keyboard, build_home_text,
+    build_queue_keyboard, build_queue_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -19,18 +20,29 @@ router = Router()
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message):
-    """Start command offering greeting and access details."""
-    text = (
-        "👋 <b>Welcome to the Media Downloader Bot!</b>\n\n"
-        "This is a private, resource-efficient video downloader bot. "
-        "You are authorized to use this service.\n\n"
-        "Paste a supported media URL, then choose Favorite Formats, Browse All Formats, or Audio Only.\n\n"
-        "Playlists and multimedia posts have individual item selection. Use /settings for send mode and format preferences. "
-        "Original streams are preserved without compression or transcoding.\n\n"
-        "Use /help for the usage and codec guide."
+async def cmd_start(
+    message: Message, db: Database, user_db: dict, governor: ResourceGovernor,
+):
+    """Compact operational home screen."""
+    if not message.from_user:
+        return
+    jobs = await db.get_active_jobs_for_user(message.from_user.id)
+    active_statuses = {
+        "claimed", "downloading_video", "downloading_audio", "merging", "uploading",
+    }
+    active = sum(job.status.value in active_statuses for job in jobs)
+    await message.reply(
+        build_home_text(
+            active=active, waiting=len(jobs) - active,
+            download_target=governor.settings.max_concurrent_downloads,
+            mode=governor.settings.resource_mode.value,
+            max_links=governor.settings.max_batch_urls,
+        ),
+        reply_markup=build_home_keyboard(
+            is_admin=bool(user_db.get("is_admin")),
+            max_links=governor.settings.max_batch_urls,
+        ),
     )
-    await message.reply(text)
 
 
 @router.message(Command("help"))
@@ -62,6 +74,22 @@ async def cmd_settings(message: Message, db: Database):
     await db.delete_ui_draft(message.from_user.id, "favorites-context")
     await message.reply(
         build_settings_text(preferences), reply_markup=build_settings_keyboard(preferences)
+    )
+
+
+@router.message(Command("queue"))
+async def cmd_queue(message: Message, db: Database, user_db: dict):
+    if not message.from_user:
+        return
+    jobs = await db.get_active_jobs_for_user(message.from_user.id)
+    positions = {}
+    for job in jobs:
+        position = await db.queue_position(job.job_id)
+        if position is not None:
+            positions[job.job_id] = position
+    await message.reply(
+        build_queue_text(jobs, positions),
+        reply_markup=build_queue_keyboard(jobs, admin=bool(user_db.get("is_admin"))),
     )
 
 

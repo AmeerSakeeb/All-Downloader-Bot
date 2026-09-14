@@ -96,9 +96,12 @@ class MediaItem(BaseModel):
     collection_entry_id: Optional[str] = None
     title: str = "Media item"
     extractor_id: Optional[str] = None
+    source_extractor: Optional[str] = None
     max_height: Optional[int] = None
     formats: List["MediaFormat"] = Field(default_factory=list)
     thumbnail_url: Optional[str] = None
+    analysis_status: str = "ready"
+    analysis_error_category: Optional[str] = None
 
 
 class MediaFormat(BaseModel):

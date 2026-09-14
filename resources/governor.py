@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from core.config import ResourceMode, Settings, get_settings
 from resources.detector import ResourceDetector
@@ -50,6 +50,7 @@ class ResourceGovernor:
         self._stable_limits: dict[str, int] = {}
         self._last_limit_change = 0.0
         self._last_sample: Optional[dict[str, object]] = None
+        self._capacity_listener: Optional[Callable[[], None]] = None
 
     @property
     def active_counts(self) -> dict[str, int]:
@@ -63,9 +64,14 @@ class ResourceGovernor:
         if stage in self._active_counts:
             self._active_counts[stage] = max(0, self._active_counts[stage] - 1)
 
+    def set_capacity_listener(self, listener: Callable[[], None]) -> None:
+        self._capacity_listener = listener
+
     async def _release(self, stage: str) -> None:
         async with self._lock:
             self.register_stage_end(stage)
+        if self._capacity_listener:
+            self._capacity_listener()
 
     async def adaptive_limits(self) -> dict[str, int]:
         sample = await self.detector.sample()
@@ -129,7 +135,14 @@ class ResourceGovernor:
                 for stage, previous in self._stable_limits.items()
             }
             self._last_limit_change = now
-        return dict(self._stable_limits)
+        # Hysteresis may delay increases, but an administrator lowering a
+        # target must immediately block additional admissions. Active leases
+        # are deliberately not cancelled.
+        effective = dict(self._stable_limits)
+        for stage, ceiling in configured.items():
+            if ceiling:
+                effective[stage] = min(effective[stage], ceiling)
+        return effective
 
     async def acquire_stage(self, stage: str) -> tuple[Optional[StageLease], str]:
         if stage not in self._active_counts:
@@ -155,15 +168,22 @@ class ResourceGovernor:
             return running_jobs
         async with self._lock:
             active = dict(self._active_counts)
-        # Shared extraction work consumes the same admission budget. Jobs not yet
-        # holding a lease also count, so dispatch cannot run ahead of admission.
-        budget = min(limits["download"], limits["extraction"])
+        # Scheduler tasks move through independently leased stages. Capacity is
+        # the largest live stage target, not the minimum: lowering extraction
+        # must not permanently cap download concurrency after a job leaves the
+        # extraction stage. A task denied its next lease returns durably to
+        # WAITING_RESOURCES and is reclaimed on the bounded retry cadence.
+        budget = max(limits.values())
         external_extractions = max(
             0, active["extraction"] - max(
                 0, running_jobs - sum(active[s] for s in ("download", "merge", "upload"))
             )
         )
-        budget = max(0, budget - external_extractions)
+        if external_extractions:
+            budget = max(
+                limits["download"], limits["merge"], limits["upload"],
+                max(0, limits["extraction"] - external_extractions),
+            )
         return max(running_jobs, budget)
 
     async def admit_stage(
@@ -201,6 +221,22 @@ class ResourceGovernor:
         if loads[0] and float(loads[0]) > float(cpu["cores"]) * 1.25:
             return False, "system load average is under pressure"
         return True, "Ready"
+
+    def current_pressure_reason(self, effective: Optional[dict[str, int]] = None) -> str:
+        ok, reason = self._pressure_check(self._last_sample)
+        if not ok:
+            return reason
+        if effective:
+            configured = {
+                "extraction": self.settings.max_concurrent_extractions,
+                "download": self.settings.max_concurrent_downloads,
+                "merge": self.settings.max_concurrent_merges,
+                "upload": self.settings.max_concurrent_uploads,
+            }
+            if any(configured[stage] and effective[stage] < configured[stage]
+                   for stage in self.STAGES):
+                return "adaptive shared-VM safety capacity"
+        return "Resources currently healthy"
 
     def disk_safety_bytes(self) -> int:
         capacity = self.file_mgr.get_disk_capacity()

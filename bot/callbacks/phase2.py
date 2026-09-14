@@ -24,15 +24,21 @@ from security.ssrf import SSRFGuard
 from services.favorites import FavoriteMatcher
 from services.selection import SelectionResult, submit_exact_selection
 from services.telegram_api import TelegramService
+from services.runtime_settings import RuntimeSettingError, RuntimeSettingsService
 from storage.database import Database, QueueLimitError
 from ui.builders import (
     build_admin_keyboard, build_admin_status_text, build_all_formats_keyboard,
+    build_all_formats_text,
     build_assets_keyboard, build_audio_keyboard, build_collection_keyboard,
     build_collection_text, build_favorites_keyboard, build_favorites_text,
     build_filter_keyboard, build_format_details_keyboard, build_format_details_text,
     build_item_selection_keyboard, build_media_info_details, build_preferred_keyboard,
     build_preferred_media_text, build_resource_keyboard, build_rule_choices,
-    build_rule_editor, build_settings_keyboard, build_settings_text, build_users_keyboard,
+    build_home_keyboard, build_home_text, build_performance_keyboard,
+    build_performance_text, build_performance_advanced_keyboard,
+    build_performance_advanced_text, build_queue_keyboard, build_queue_text,
+    build_rule_editor, build_settings_keyboard, build_settings_section_keyboard,
+    build_settings_text, build_users_keyboard,
     build_user_details, format_button_label,
 )
 
@@ -75,7 +81,9 @@ async def _preferred(session: MediaSession, db: Database, page: int = 0):
     )
 
 
-async def _render_submission(callback: CallbackQuery, result: SelectionResult) -> None:
+async def _render_submission(
+    callback: CallbackQuery, result: SelectionResult, db: Database,
+) -> None:
     if not callback.message:
         return
     message = cast(Any, callback.message)
@@ -90,8 +98,11 @@ async def _render_submission(callback: CallbackQuery, result: SelectionResult) -
         )
     else:
         assert result.job
+        position = await db.queue_position(result.job.job_id)
         await message.edit_text(
-            "⏳ <b>Queued</b>\n\nWaiting for safe resource admission.",
+            "⏳ <b>Queued</b>\n\nYour download is saved and will start automatically.\n"
+            + (f"Position: {position}\n" if position else "")
+            + "No resend required.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
                 text="❌ Cancel my delivery", callback_data=f"cancel_sub:{result.subscriber_id}"
             )]]),
@@ -114,10 +125,20 @@ async def _submit(
             user_id=callback.from_user.id, chat_id=message.chat.id,
             message_id=message.message_id, media_kind=media_kind,
         )
-    except (QueueLimitError, ValueError) as error:
+    except QueueLimitError as error:
+        await message.edit_text(
+            f"📋 <b>Queue full</b>\n\nYour selection was not accepted.\n\n{escape(str(error))}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 View Queue", callback_data="queue:mine")],
+                [InlineKeyboardButton(text="🏠 Home", callback_data="home:show")],
+            ]),
+        )
         await callback.answer(str(error), show_alert=True)
         return
-    await _render_submission(callback, result)
+    except ValueError as error:
+        await callback.answer(str(error), show_alert=True)
+        return
+    await _render_submission(callback, result, db)
     await callback.answer("Ready")
 
 
@@ -135,7 +156,7 @@ async def preferred(callback: CallbackQuery, db: Database) -> None:
 @router.callback_query(F.data.startswith(("detail:", "adetail:")))
 async def details(callback: CallbackQuery, db: Database) -> None:
     parts = (callback.data or "").split(":")
-    if len(parts) != 3:
+    if len(parts) not in {3, 4}:
         return
     session = await _owned(callback, db, parts[1])
     if not session:
@@ -159,13 +180,14 @@ async def details(callback: CallbackQuery, db: Database) -> None:
             reply_markup=build_format_details_keyboard(
                 session, fmt, back="all" if parts[0] == "adetail" else "preferred",
                 manual_audio_required=manual_audio_required,
+                back_page=int(parts[3]) if len(parts) == 4 and parts[3].isdigit() else 0,
             ),
         )
     await callback.answer()
 
 
 async def _filters(db: Database, user_id: int, session_id: str) -> dict[str, Any]:
-    draft_key = f"filters:{session_id}"
+    draft_key = f"format_filters:{session_id}"
     draft = await db.get_ui_draft(user_id, draft_key)
     if not draft or draft.get("kind") != "filters" or draft.get("session_id") != session_id:
         draft = {"kind": "filters", "session_id": session_id, "filters": {}}
@@ -182,11 +204,11 @@ async def all_formats(callback: CallbackQuery, db: Database) -> None:
     if not session:
         return
     filters = await _filters(db, callback.from_user.id, session.session_id)
-    count = len([fmt for fmt in session.formats if fmt.is_video])
+    page = int(parts[2]) if parts[2].isdigit() else 0
     if callback.message:
         await cast(Any, callback.message).edit_text(
-            f"🎞 <b>Browse All Formats</b>\n\n{count} genuine video formats retained. Filters change presentation only.",
-            reply_markup=build_all_formats_keyboard(session, filters, int(parts[2])),
+            build_all_formats_text(session, filters, page),
+            reply_markup=build_all_formats_keyboard(session, filters, page),
         )
     await callback.answer()
 
@@ -208,11 +230,14 @@ async def filter_menu(callback: CallbackQuery, db: Database) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("ftoggle:"))
+@router.callback_query(F.data.startswith(("ft:", "ftoggle:")))
 async def filter_toggle(callback: CallbackQuery, db: Database) -> None:
     parts = (callback.data or "").split(":")
     if len(parts) != 4:
         return
+    parts[2] = {
+        "c": "codec", "r": "resolution", "f": "fps", "e": "container",
+    }.get(parts[2], parts[2])
     session = await _owned(callback, db, parts[1])
     if not session:
         return
@@ -227,7 +252,7 @@ async def filter_toggle(callback: CallbackQuery, db: Database) -> None:
         values = values or ["any"]
     filters[parts[2]] = values
     await db.save_ui_draft(
-        callback.from_user.id, f"filters:{parts[1]}",
+        callback.from_user.id, f"format_filters:{parts[1]}",
         {"kind": "filters", "session_id": parts[1], "filters": filters},
     )
     await cast(Any, callback.message).edit_reply_markup(
@@ -242,11 +267,12 @@ async def filter_reset(callback: CallbackQuery, db: Database) -> None:
     session = await _owned(callback, db, session_id)
     if session:
         await db.save_ui_draft(
-            callback.from_user.id, f"filters:{session_id}",
+            callback.from_user.id, f"format_filters:{session_id}",
             {"kind": "filters", "session_id": session_id, "filters": {}},
         )
-        await cast(Any, callback.message).edit_reply_markup(
-            reply_markup=build_all_formats_keyboard(session, {}, 0)
+        await cast(Any, callback.message).edit_text(
+            build_all_formats_text(session, {}, 0),
+            reply_markup=build_all_formats_keyboard(session, {}, 0),
         )
         await callback.answer("Filters reset")
 
@@ -258,7 +284,7 @@ async def search_formats(callback: CallbackQuery, db: Database) -> None:
     if not session:
         return
     filters = await _filters(db, callback.from_user.id, session_id)
-    await db.save_ui_draft(callback.from_user.id, "format-search", {
+    await db.save_ui_draft(callback.from_user.id, f"format_search:{session_id}", {
         "kind": "format_search", "session_id": session_id,
     })
     await cast(Any, callback.message).edit_text(
@@ -462,6 +488,31 @@ async def settings_update(callback: CallbackQuery, db: Database) -> None:
     await callback.answer("Saved")
 
 
+@router.callback_query(F.data.startswith("uset:"))
+async def settings_section(callback: CallbackQuery, db: Database) -> None:
+    if not await _authorized(callback, db):
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) not in {2, 3} or parts[1] not in {"delivery", "audio", "workflow"}:
+        return
+    media_session_id = parts[2] if len(parts) == 3 else None
+    if media_session_id and not await _owned(callback, db, media_session_id):
+        return
+    current = await db.get_user_settings(callback.from_user.id)
+    labels = {
+        "delivery": "📦 <b>Delivery</b>\n\nChoose how unchanged media is sent.",
+        "audio": "🎵 <b>Audio</b>\n\nControl exact companion-audio selection.",
+        "workflow": "🎯 <b>Default Workflow</b>\n\nChoose matching and detail preferences.",
+    }
+    await cast(Any, callback.message).edit_text(
+        labels[parts[1]],
+        reply_markup=build_settings_section_keyboard(
+            current, parts[1], media_session_id
+        ),
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data == "favorites")
 async def favorites(callback: CallbackQuery, db: Database) -> None:
     if not await _authorized(callback, db):
@@ -614,7 +665,8 @@ async def _extract_child_session(
         return MediaSession.with_ttl(
             ttl_seconds=max(60, int(parent.expires_at - parent.created_at)),
             user_id=user_id, url=item.source_url, canonical_url=item.source_url,
-            extractor=parent.extractor, title=item.title, media_id=item.extractor_id,
+            extractor=item.source_extractor or parent.extractor, title=item.title,
+            media_id=item.extractor_id,
             thumbnail_url=item.thumbnail_url, formats=item.formats,
             parent_collection_url=item.parent_collection_url if uses_parent else None,
             collection_entry_index=item.collection_entry_index if uses_parent else None,
@@ -623,8 +675,11 @@ async def _extract_child_session(
             cookie_profile=parent.cookie_profile,
         )
     lease, _ = await governor.acquire_stage("extraction")
-    if not lease:
-        return None
+    while not lease:
+        await asyncio.sleep(
+            max(1.0, min(10.0, governor.settings.scheduler_retry_seconds))
+        )
+        lease, _ = await governor.acquire_stage("extraction")
     async with lease:
         await asyncio.to_thread(SSRFGuard.validate_url, item.source_url)
         extractor = await registry.get_extractor_for_url(item.source_url)
@@ -852,7 +907,10 @@ async def collection_item(
         return
     child = await _child_session(parent, item, callback.from_user.id, extractor_registry, governor)
     if not child:
-        await callback.answer("This item is unavailable, the nesting limit was reached, or the server is busy.", show_alert=True)
+        await callback.answer(
+            "This item is unavailable or the configured nesting limit was reached.",
+            show_alert=True,
+        )
         return
     await db.save_media_session(child)
     if item.kind == "image":
@@ -980,10 +1038,42 @@ async def _show_admin(
     await cast(Any, callback.message).edit_text(text, reply_markup=build_admin_keyboard(scheduler.paused))
 
 
+async def _show_performance(
+    callback: CallbackQuery, governor: ResourceGovernor,
+    runtime_settings: RuntimeSettingsService,
+) -> None:
+    limits = await governor.adaptive_limits()
+    keys = (
+        "max_batch_urls", "max_concurrent_downloads", "max_concurrent_extractions",
+        "max_concurrent_merges", "max_concurrent_uploads",
+    )
+    values = {key: runtime_settings.get(key) for key in keys}
+    await cast(Any, callback.message).edit_text(
+        build_performance_text(
+            values, limits, governor.active_counts,
+            governor.current_pressure_reason(limits),
+        ),
+        reply_markup=build_performance_keyboard(values),
+    )
+
+
+async def _show_advanced_performance(
+    callback: CallbackQuery, runtime_settings: RuntimeSettingsService,
+) -> None:
+    keys = (
+        "max_queued_jobs_per_user", "max_total_queued_jobs", "bandwidth_ceiling",
+    )
+    values = {key: runtime_settings.get(key) for key in keys}
+    await cast(Any, callback.message).edit_text(
+        build_performance_advanced_text(values),
+        reply_markup=build_performance_advanced_keyboard(values),
+    )
+
+
 @router.callback_query(F.data.startswith("admin:"))
 async def admin_actions(
     callback: CallbackQuery, db: Database, governor: ResourceGovernor,
-    scheduler: JobScheduler,
+    scheduler: JobScheduler, runtime_settings: RuntimeSettingsService,
 ) -> None:
     if not await _admin(callback, db):
         return
@@ -1011,6 +1101,21 @@ async def admin_actions(
         )
         await callback.answer()
         return
+    elif action == "performance":
+        await _show_performance(callback, governor, runtime_settings)
+        await callback.answer()
+        return
+    elif action == "maintenance":
+        await cast(Any, callback.message).edit_text(
+            "🧹 <b>Maintenance</b>\n\nChoose a confirmed maintenance operation.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Clean expired data", callback_data="ops:cleanup")],
+                [InlineKeyboardButton(text="Create private backup", callback_data="ops:backup")],
+                [InlineKeyboardButton(text="↩️ Back", callback_data="admin:status")],
+            ]),
+        )
+        await callback.answer()
+        return
     await _show_admin(callback, db, governor, scheduler)
     await callback.answer("Updated")
 
@@ -1018,14 +1123,173 @@ async def admin_actions(
 @router.callback_query(F.data.startswith("resource:"))
 async def resource_mode(
     callback: CallbackQuery, db: Database, governor: ResourceGovernor,
+    runtime_settings: RuntimeSettingsService,
 ) -> None:
     if not await _admin(callback, db):
         return
     mode = ResourceMode((callback.data or "").split(":", 1)[-1])
-    governor.settings.resource_mode = mode
-    await db.set_system_setting("resource_mode", mode.value)
+    await runtime_settings.set("resource_mode", mode.value, updated_by=callback.from_user.id)
     await cast(Any, callback.message).edit_reply_markup(reply_markup=build_resource_keyboard(mode.value))
     await callback.answer("Resource mode saved")
+
+
+@router.callback_query(F.data.startswith("perf:"))
+async def performance_adjust(
+    callback: CallbackQuery, db: Database, governor: ResourceGovernor,
+    runtime_settings: RuntimeSettingsService,
+) -> None:
+    if not await _admin(callback, db):
+        return
+    aliases = {
+        "batch": ("max_batch_urls", 1), "down": ("max_concurrent_downloads", 1),
+        "extract": ("max_concurrent_extractions", 1),
+        "merge": ("max_concurrent_merges", 1),
+        "upload": ("max_concurrent_uploads", 1),
+        "userq": ("max_queued_jobs_per_user", 1),
+        "globalq": ("max_total_queued_jobs", 10),
+        "bw": ("bandwidth_ceiling", 1024 * 1024),
+    }
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in aliases or parts[2] not in {"-1", "1", "+1"}:
+        await callback.answer("Invalid setting action.", show_alert=True)
+        return
+    key, step = aliases[parts[1]]
+    value = int(runtime_settings.get(key)) + int(parts[2]) * step
+    try:
+        await runtime_settings.set(key, value, updated_by=callback.from_user.id)
+    except RuntimeSettingError as error:
+        await callback.answer(str(error), show_alert=True)
+        return
+    if parts[1] in {"userq", "globalq", "bw"}:
+        await _show_advanced_performance(callback, runtime_settings)
+    else:
+        await _show_performance(callback, governor, runtime_settings)
+    await callback.answer("Saved live")
+
+
+@router.callback_query(F.data == "perfadvanced:show")
+async def performance_advanced(
+    callback: CallbackQuery, db: Database,
+    runtime_settings: RuntimeSettingsService,
+) -> None:
+    if not await _admin(callback, db):
+        return
+    await _show_advanced_performance(callback, runtime_settings)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("perfreset:"))
+async def performance_reset(
+    callback: CallbackQuery, db: Database, governor: ResourceGovernor,
+    runtime_settings: RuntimeSettingsService,
+) -> None:
+    if not await _admin(callback, db):
+        return
+    aliases = {
+        "batch": "max_batch_urls", "down": "max_concurrent_downloads",
+        "extract": "max_concurrent_extractions", "merge": "max_concurrent_merges",
+        "upload": "max_concurrent_uploads", "userq": "max_queued_jobs_per_user",
+        "globalq": "max_total_queued_jobs", "bw": "bandwidth_ceiling",
+    }
+    alias = (callback.data or "").split(":", 1)[-1]
+    if alias not in aliases:
+        await callback.answer("Invalid setting action.", show_alert=True)
+        return
+    await runtime_settings.reset(aliases[alias], updated_by=callback.from_user.id)
+    if alias in {"userq", "globalq", "bw"}:
+        await _show_advanced_performance(callback, runtime_settings)
+    else:
+        await _show_performance(callback, governor, runtime_settings)
+    await callback.answer("Reset to bootstrap default")
+
+
+async def _render_home(callback: CallbackQuery, db: Database, governor: ResourceGovernor) -> None:
+    jobs = await db.get_active_jobs_for_user(callback.from_user.id)
+    active_statuses = {
+        "claimed", "downloading_video", "downloading_audio", "merging", "uploading",
+    }
+    user = await db.get_user(callback.from_user.id)
+    active = sum(job.status.value in active_statuses for job in jobs)
+    waiting = len(jobs) - active
+    await cast(Any, callback.message).edit_text(
+        build_home_text(
+            active=active, waiting=waiting,
+            download_target=governor.settings.max_concurrent_downloads,
+            mode=governor.settings.resource_mode.value,
+            max_links=governor.settings.max_batch_urls,
+        ),
+        reply_markup=build_home_keyboard(
+            is_admin=bool(user and user["is_admin"]),
+            max_links=governor.settings.max_batch_urls,
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("home:"))
+async def home_actions(
+    callback: CallbackQuery, db: Database, governor: ResourceGovernor,
+) -> None:
+    if not await _authorized(callback, db):
+        return
+    action = (callback.data or "").split(":", 1)[-1]
+    if action == "show":
+        await _render_home(callback, db, governor)
+    elif action == "new":
+        await cast(Any, callback.message).edit_text(
+            f"📥 <b>New Download</b>\n\nSend one URL or up to "
+            f"{governor.settings.max_batch_urls} URLs in one message."
+        )
+    else:
+        await cast(Any, callback.message).edit_text(
+            "❓ <b>Help</b>\n\nSend public, non-DRM media links. Choose an exact source "
+            "format after analysis. Streams are never transcoded or silently substituted.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🏠 Home", callback_data="home:show")
+            ]]),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "queue:mine")
+async def queue_panel(callback: CallbackQuery, db: Database) -> None:
+    if not await _authorized(callback, db):
+        return
+    jobs = await db.get_active_jobs_for_user(callback.from_user.id)
+    positions = {
+        job.job_id: position
+        for job in jobs
+        if (position := await db.queue_position(job.job_id)) is not None
+    }
+    user = await db.get_user(callback.from_user.id)
+    await cast(Any, callback.message).edit_text(
+        build_queue_text(jobs, positions),
+        reply_markup=build_queue_keyboard(jobs, admin=bool(user and user["is_admin"])),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("qcancel:"))
+async def queue_cancel(
+    callback: CallbackQuery, db: Database, scheduler: JobScheduler,
+) -> None:
+    if not await _authorized(callback, db):
+        return
+    job_id = (callback.data or "").split(":", 1)[-1]
+    cancelled = await db.cancel_waiting_subscriber_for_job(job_id, callback.from_user.id)
+    if not cancelled:
+        await callback.answer("This delivery is no longer waiting.", show_alert=True)
+        return
+    if await db.count_waiting_subscribers(job_id) == 0:
+        await scheduler.cancel_running_job(job_id)
+    jobs = await db.get_active_jobs_for_user(callback.from_user.id)
+    positions = {
+        job.job_id: position for job in jobs
+        if (position := await db.queue_position(job.job_id)) is not None
+    }
+    await cast(Any, callback.message).edit_text(
+        build_queue_text(jobs, positions), reply_markup=build_queue_keyboard(jobs)
+    )
+    await callback.answer("Cancelled")
 
 
 @router.callback_query(F.data.startswith("user:"))
