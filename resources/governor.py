@@ -222,8 +222,18 @@ class ResourceGovernor:
     async def growth_is_safe(self, job_id: str, actual_bytes: int) -> bool:
         if self.settings.max_job_size_bytes and actual_bytes > self.settings.max_job_size_bytes:
             return False
-        if not await self.db.update_disk_growth(job_id, actual_bytes):
-            return False
         free = self.file_mgr.get_free_disk_space()
-        other = await self.db.get_total_reserved_bytes(job_id)
-        return free - other - self.disk_safety_bytes() > 0
+        safety = self.disk_safety_bytes()
+        usable = max(0, free - safety)
+        extension = max(
+            8 * 1024**2,
+            min(256 * 1024**2, max(1, usable // 4)),
+        )
+        return await self.db.extend_disk_reservation_atomic(
+            job_id,
+            actual_bytes,
+            free,
+            safety,
+            extension,
+            self.settings.max_job_size_bytes,
+        )

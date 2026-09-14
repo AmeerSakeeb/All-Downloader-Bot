@@ -1,11 +1,33 @@
 """Structured exception hierarchy for categorized error reporting."""
 
+from enum import Enum
 from typing import Optional
+
+
+class ErrorCategory(str, Enum):
+    UNEXPECTED_ERROR = "unexpected_error"
+    UNSAFE_URL = "unsafe_url"
+    ACCESS_DENIED = "access_denied"
+    EXTRACTION_FAILED = "extraction_failed"
+    EXTRACTION_TIMEOUT = "extraction_timeout"
+    SITE_ACCESS_CHALLENGE = "site_access_challenge"
+    UNSUPPORTED_URL = "unsupported_url"
+    MEDIA_UNAVAILABLE = "media_unavailable"
+    DRM_UNSUPPORTED = "drm_unsupported"
+    DOWNLOAD_FAILED = "download_failed"
+    EXACT_FORMAT_DISAPPEARED = "exact_format_disappeared"
+    AUTHENTICATION_REQUIRED = "authentication_required"
+    RESOURCE_WAIT = "resource_wait"
+    INSUFFICIENT_DISK = "insufficient_disk"
+    LOSSLESS_MERGE_UNAVAILABLE = "lossless_merge_unavailable"
+    CANCELLED = "cancelled"
+    DELIVERY_SIZE_EXCEEDED = "delivery_size_exceeded"
+    TELEGRAM_DELIVERY_FAILED = "telegram_delivery_failed"
 
 
 class BotError(Exception):
     """Base exception for all bot errors."""
-    error_category: str = "unexpected_error"
+    error_category: str = ErrorCategory.UNEXPECTED_ERROR.value
 
     def __init__(self, message: str, user_message: Optional[str] = None):
         super().__init__(message)
@@ -16,12 +38,12 @@ class BotError(Exception):
 
 class SecurityError(BotError):
     """Raised when a security validation fails (SSRF, path traversal, etc.)."""
-    error_category: str = "unsafe_url"
+    error_category: str = ErrorCategory.UNSAFE_URL.value
 
 
 class SSRFError(SecurityError):
     """Raised when an outbound URL points to a forbidden destination."""
-    error_category: str = "unsafe_url"
+    error_category: str = ErrorCategory.UNSAFE_URL.value
 
     def __init__(self, url: str, reason: str):
         super().__init__(
@@ -32,7 +54,7 @@ class SSRFError(SecurityError):
 
 class AccessDeniedError(BotError):
     """Raised when an unauthorized user attempts an operation."""
-    error_category: str = "access_denied"
+    error_category: str = ErrorCategory.ACCESS_DENIED.value
 
     def __init__(self, user_id: int):
         super().__init__(
@@ -43,11 +65,11 @@ class AccessDeniedError(BotError):
 
 class ExtractionError(BotError):
     """Raised when metadata extraction fails."""
-    error_category: str = "extraction_failed"
+    error_category: str = ErrorCategory.EXTRACTION_FAILED.value
 
 
 class ExtractionTimeoutError(ExtractionError):
-    error_category: str = "extraction_timeout"
+    error_category: str = ErrorCategory.EXTRACTION_TIMEOUT.value
 
     def __init__(self):
         super().__init__(
@@ -57,7 +79,7 @@ class ExtractionTimeoutError(ExtractionError):
 
 
 class SiteAccessChallengeError(ExtractionError):
-    error_category: str = "site_access_challenge"
+    error_category: str = ErrorCategory.SITE_ACCESS_CHALLENGE.value
 
     def __init__(self):
         super().__init__(
@@ -70,7 +92,7 @@ class SiteAccessChallengeError(ExtractionError):
 
 
 class UnsupportedUrlError(ExtractionError):
-    error_category: str = "unsupported_url"
+    error_category: str = ErrorCategory.UNSUPPORTED_URL.value
 
     def __init__(self, url: str):
         super().__init__(
@@ -80,7 +102,7 @@ class UnsupportedUrlError(ExtractionError):
 
 
 class MediaUnavailableError(ExtractionError):
-    error_category: str = "media_unavailable"
+    error_category: str = ErrorCategory.MEDIA_UNAVAILABLE.value
 
     def __init__(self, url: str, reason: str = "Media not found"):
         super().__init__(
@@ -90,7 +112,7 @@ class MediaUnavailableError(ExtractionError):
 
 
 class DRMProtectedError(ExtractionError):
-    error_category: str = "drm_unsupported"
+    error_category: str = ErrorCategory.DRM_UNSUPPORTED.value
 
     def __init__(self, url: str):
         super().__init__(
@@ -101,13 +123,13 @@ class DRMProtectedError(ExtractionError):
 
 class DownloadError(BotError):
     """Raised when a download operation fails."""
-    error_category: str = "download_failed"
+    error_category: str = ErrorCategory.DOWNLOAD_FAILED.value
 
 
 class ExactFormatUnavailableError(BotError):
     """The immutable source-format selection disappeared or materially changed."""
 
-    error_category: str = "exact_format_disappeared"
+    error_category: str = ErrorCategory.EXACT_FORMAT_DISAPPEARED.value
 
     def __init__(self):
         super().__init__(
@@ -120,7 +142,7 @@ class ExactFormatUnavailableError(BotError):
 
 
 class AuthenticationRequiredError(ExtractionError):
-    error_category: str = "authentication_required"
+    error_category: str = ErrorCategory.AUTHENTICATION_REQUIRED.value
 
     def __init__(self):
         super().__init__(
@@ -131,11 +153,11 @@ class AuthenticationRequiredError(ExtractionError):
 
 class ResourceExhaustedError(BotError):
     """Raised when system resources (RAM, disk) prevent starting an operation."""
-    error_category: str = "resource_wait"
+    error_category: str = ErrorCategory.RESOURCE_WAIT.value
 
 
 class InsufficientDiskSpaceError(ResourceExhaustedError):
-    error_category: str = "insufficient_disk"
+    error_category: str = ErrorCategory.INSUFFICIENT_DISK.value
 
     def __init__(self, required_bytes: int, available_bytes: int):
         req_mb = required_bytes / (1024 * 1024)
@@ -148,7 +170,7 @@ class InsufficientDiskSpaceError(ResourceExhaustedError):
 
 class StreamIncompatibleError(BotError):
     """Raised when selected streams cannot be losslessly combined without transcoding."""
-    error_category: str = "lossless_merge_unavailable"
+    error_category: str = ErrorCategory.LOSSLESS_MERGE_UNAVAILABLE.value
 
     def __init__(self, video_codec: str, audio_codec: str, container: str):
         super().__init__(
@@ -162,7 +184,7 @@ class StreamIncompatibleError(BotError):
 
 class JobCancelledError(BotError):
     """Raised when a job is cancelled by the user or admin."""
-    error_category: str = "cancelled"
+    error_category: str = ErrorCategory.CANCELLED.value
 
     def __init__(self, job_id: str):
         super().__init__(f"Job {job_id} was cancelled", user_message="⏹️ Download cancelled.")

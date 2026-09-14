@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import PurePosixPath
 from typing import Mapping
 from urllib.parse import urljoin, urlsplit
@@ -51,6 +52,7 @@ class DirectMediaExtractor(Extractor):
         is_video = content_type.startswith("video/") or not is_audio
         size_value = headers.get("Content-Length")
         filesize = int(size_value) if size_value and size_value.isdigit() else None
+        source_identity = self._source_identity(final_url, headers, filesize)
         media_format = MediaFormat(
             format_id="direct",
             is_video=is_video,
@@ -65,16 +67,46 @@ class DirectMediaExtractor(Extractor):
             protocol=parsed.scheme,
             filesize=filesize,
             format_note="Direct media (codecs unverified)",
+            source_identity=source_identity,
         )
         return MediaSession.with_ttl(
             ttl_seconds=settings.media_session_ttl,
             user_id=user_id,
             url=url,
-            canonical_url=final_url,
+            canonical_url=source_identity["final_resource"],
             extractor="direct",
             title=filename,
             formats=[media_format],
         )
+
+    @staticmethod
+    def _source_identity(
+        final_url: str, headers: Mapping[str, str], filesize: int | None
+    ) -> dict[str, str | int]:
+        parsed = urlsplit(final_url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        authority = f"[{host}]" if ":" in host else host
+        if parsed.port and not (
+            (parsed.scheme.lower() == "http" and parsed.port == 80)
+            or (parsed.scheme.lower() == "https" and parsed.port == 443)
+        ):
+            authority += f":{parsed.port}"
+        identity: dict[str, str | int] = {
+            "final_resource": f"{parsed.scheme.lower()}://{authority}{parsed.path or '/'}"
+        }
+        if filesize is not None:
+            identity["content_length"] = filesize
+        etag = headers.get("ETag")
+        if etag and not etag.strip().lower().startswith("w/"):
+            identity["strong_etag_sha256"] = hashlib.sha256(
+                etag.strip().encode("utf-8", errors="replace")
+            ).hexdigest()
+        last_modified = headers.get("Last-Modified")
+        if last_modified:
+            identity["last_modified_sha256"] = hashlib.sha256(
+                last_modified.strip().encode("utf-8", errors="replace")
+            ).hexdigest()
+        return identity
 
     async def _head_with_safe_redirects(
         self, initial_url: str, proxy_url: str

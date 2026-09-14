@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from core.config import ResourceMode, Settings, get_settings
-from core.exceptions import BotError, ExactFormatUnavailableError, ResourceExhaustedError
+from core.exceptions import (
+    BotError,
+    ErrorCategory,
+    ExactFormatUnavailableError,
+    InsufficientDiskSpaceError,
+    ResourceExhaustedError,
+)
 from core.models import DownloadJob, JobStatus, MediaFormat, MediaSession
 from downloads.downloader import Downloader
 from downloads.ffmpeg_manager import FFmpegManager
@@ -29,6 +36,12 @@ ExtractorFactory = Callable[[str], Awaitable[Extractor]]
 
 class _ExtractionResourcesUnavailable(ResourceExhaustedError):
     """Admission denial, distinct from execution-time disk/resource failures."""
+
+
+@dataclass(frozen=True)
+class DownloadedStreams:
+    primary: Path
+    audio: Optional[Path] = None
 
 
 class JobScheduler:
@@ -255,9 +268,12 @@ class JobScheduler:
                     )
                     return
                 await self._raise_if_cancelled(job_id)
-                final_path = await self._download(job, video, audio, progress)
+                streams = await self._download(job, video, audio, progress)
+                final_path = streams.primary
 
             if audio:
+                if streams.audio is None:
+                    raise RuntimeError("Companion audio path was not retained")
                 await self._raise_if_cancelled(job_id)
                 lease, reason = await self.governor.acquire_stage("merge")
                 if not lease:
@@ -266,25 +282,43 @@ class JobScheduler:
                     )
                     return
                 async with lease:
+                    actual_inputs = streams.primary.stat().st_size + streams.audio.stat().st_size
+                    current_usage = self.file_mgr.job_disk_usage(job.job_id)
+                    merge_projection = current_usage + int(actual_inputs * 1.1)
+                    if not await self.governor.reserve_job_disk(
+                        job.job_id, merge_projection
+                    ):
+                        raise InsufficientDiskSpaceError(
+                            merge_projection, self.file_mgr.get_free_disk_space()
+                        )
                     await self._set_status(
                         job, JobStatus.MERGING, "Combining streams losslessly"
                     )
-                    video_path = self.file_mgr.get_job_file_path(
-                        job.job_id, f"video_stream.{safe_extension(video.ext)}"
-                    )
-                    audio_path = self.file_mgr.get_job_file_path(
-                        job.job_id, f"audio_stream.{safe_extension(audio.ext)}"
-                    )
+
+                    async def merge_growth_check() -> None:
+                        actual = self.file_mgr.job_disk_usage(job.job_id)
+                        if not await self.governor.growth_is_safe(job.job_id, actual):
+                            raise InsufficientDiskSpaceError(
+                                actual, self.file_mgr.get_free_disk_space()
+                            )
+
                     final_path = await self.ffmpeg_mgr.merge_streams(
-                        video_path,
-                        audio_path,
+                        streams.primary,
+                        streams.audio,
                         self.file_mgr.get_job_file_path(
                             job.job_id, f"merged_output.{safe_extension(video.ext, 'mkv')}"
                         ),
                         job_id=job.job_id,
+                        growth_check=merge_growth_check,
                     )
 
             await self._raise_if_cancelled(job_id)
+            if self.telegram_service:
+                allowed, reason = self.telegram_service.can_deliver_size(
+                    final_path.stat().st_size
+                )
+                if not allowed:
+                    raise DeliverySizeError(reason, user_message=reason)
             lease, reason = await self.governor.acquire_stage("upload")
             if not lease:
                 await self._set_status(
@@ -337,7 +371,9 @@ class JobScheduler:
             current = await self.db.get_job(job_id)
             if current and current.status != JobStatus.CANCELLED:
                 current.error_category = (
-                    error.error_category if isinstance(error, BotError) else "unexpected_error"
+                    error.error_category
+                    if isinstance(error, BotError)
+                    else ErrorCategory.UNEXPECTED_ERROR.value
                 )
                 # Some low-level BotError messages contain paths/URLs; never
                 # forward diagnostics to Telegram or the persisted public message.
@@ -356,7 +392,7 @@ class JobScheduler:
         video: MediaFormat,
         audio: Optional[MediaFormat],
         progress_handler: Optional[ProgressHandler] = None,
-    ) -> Path:
+    ) -> DownloadedStreams:
         async def pid_update(pid: int) -> None:
             job.process_pid = pid
             await self.db.save_job(job)
@@ -374,10 +410,11 @@ class JobScheduler:
             "audio_stream" if job.media_kind == "audio" else
             "source_asset" if job.media_kind == "asset" else "video_stream"
         )
-        video_path = self.file_mgr.get_job_file_path(
-            job.job_id, f"{primary_name}.{safe_extension(video.ext)}"
+        video_name = f"{primary_name}.{safe_extension(video.ext)}"
+        video_path = self.file_mgr.find_job_file(
+            job.job_id, video_name
         )
-        if not video_path.exists():
+        if video_path is None:
             status = JobStatus.DOWNLOADING_AUDIO if job.media_kind == "audio" else JobStatus.DOWNLOADING_VIDEO
             label = "Downloading original audio" if job.media_kind == "audio" else (
                 "Downloading original source asset" if job.media_kind == "asset" else "Downloading video"
@@ -387,7 +424,7 @@ class JobScheduler:
                 job.job_id,
                 job.source_url or job.canonical_url or "",
                 job.video_format_id,
-                video_path.name,
+                video_name,
                 video.effective_size,
                 video_progress,
                 pid_update,
@@ -402,17 +439,18 @@ class JobScheduler:
                 **({"cookie_profile": job.cookie_profile} if job.cookie_profile else {}),
             )
         if not audio:
-            return video_path
-        audio_path = self.file_mgr.get_job_file_path(
-            job.job_id, f"audio_stream.{safe_extension(audio.ext)}"
+            return DownloadedStreams(video_path)
+        audio_name = f"audio_stream.{safe_extension(audio.ext)}"
+        audio_path = self.file_mgr.find_job_file(
+            job.job_id, audio_name
         )
-        if not audio_path.exists():
+        if audio_path is None:
             await self._set_status(job, JobStatus.DOWNLOADING_AUDIO, "Downloading audio")
-            await self.downloader.download_format(
+            audio_path = await self.downloader.download_format(
                 job.job_id,
                 job.source_url or job.canonical_url or "",
                 job.audio_format_id or "",
-                audio_path.name,
+                audio_name,
                 audio.effective_size,
                 video_progress,
                 pid_update,
@@ -424,7 +462,7 @@ class JobScheduler:
                 **({"impersonate": True} if job.ytdlp_impersonated else {}),
                 **({"cookie_profile": job.cookie_profile} if job.cookie_profile else {}),
             )
-        return video_path
+        return DownloadedStreams(video_path, audio_path)
 
     async def _execution_formats(
         self, job: DownloadJob
@@ -518,6 +556,9 @@ class JobScheduler:
         )
         if any(getattr(expected, key) != getattr(current, key) for key in keys):
             raise ExactFormatUnavailableError()
+        for key, expected_value in expected.source_identity.items():
+            if current.source_identity.get(key) != expected_value:
+                raise ExactFormatUnavailableError()
 
     def _projected_reservation(
         self, video: MediaFormat, audio: Optional[MediaFormat], job_id: str

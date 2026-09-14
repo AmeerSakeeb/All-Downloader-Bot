@@ -31,3 +31,16 @@ def build_output_identity(
     return hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def build_completed_output_identity(
+    execution_identity: str, output_container: str
+) -> str:
+    """Bind a completed cache entry to its execution and actual container."""
+    identity = {
+        "execution_identity": execution_identity,
+        "output_container": output_container.lower().lstrip("."),
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()

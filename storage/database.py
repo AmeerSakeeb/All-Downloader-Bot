@@ -10,12 +10,13 @@ from typing import Any, Iterable, Optional
 
 import aiosqlite
 
+from core.exceptions import ErrorCategory
 from core.models import (
     DetailStyle, DownloadJob, FavoriteFormatRule, JobStatus, MatchingStrategy,
     MediaFormat, MediaSession, UserSettings,
 )
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 ACTIVE_STATUSES = tuple(
     status.value
     for status in (
@@ -93,6 +94,7 @@ class Database:
             6: self._migration_v6,
             7: self._migration_v7,
             8: self._migration_v8,
+            9: self._migration_v9,
         }
         for version in range(current + 1, CURRENT_SCHEMA_VERSION + 1):
             await db.execute("BEGIN IMMEDIATE")
@@ -404,6 +406,22 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_drafts_retention ON ui_drafts(updated_at)",
         ):
             await self.connection.execute(statement)
+
+    async def _migration_v9(self) -> None:
+        columns = {
+            row["name"]
+            for row in await (
+                await self.connection.execute("PRAGMA table_info(telegram_file_cache)")
+            ).fetchall()
+        }
+        if "execution_identity" not in columns:
+            await self.connection.execute(
+                "ALTER TABLE telegram_file_cache ADD COLUMN execution_identity TEXT"
+            )
+        await self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cache_execution "
+            "ON telegram_file_cache(execution_identity,last_used_at)"
+        )
 
     async def schema_version(self) -> int:
         row = await (
@@ -910,22 +928,95 @@ class Database:
             "DELETE FROM disk_reservations WHERE job_id=?", (job_id,)
         )
 
-    async def update_disk_growth(self, job_id: str, actual_bytes: int) -> bool:
-        """Convert projected reservation to actual usage without double counting."""
-        row = await (
-            await self.connection.execute(
-                "SELECT projected_bytes FROM disk_reservations WHERE job_id=?", (job_id,)
-            )
-        ).fetchone()
-        if not row:
+    async def extend_disk_reservation_atomic(
+        self,
+        job_id: str,
+        actual_bytes: int,
+        free_bytes: int,
+        safety_bytes: int,
+        extension_bytes: int,
+        max_projected_bytes: int = 0,
+    ) -> bool:
+        """Record growth and extend future space without double-counting physical bytes."""
+        actual_bytes = max(0, int(actual_bytes))
+        extension_bytes = max(1, int(extension_bytes))
+        maximum = max(0, int(max_projected_bytes))
+        if maximum and actual_bytes > maximum:
             return False
-        projected = int(row["projected_bytes"])
-        actual = max(0, int(actual_bytes))
-        await self.connection.execute(
-            "UPDATE disk_reservations SET actual_bytes=?,reserved_bytes=? WHERE job_id=?",
-            (actual, max(0, projected - actual), job_id),
-        )
-        return actual <= projected
+        db = await aiosqlite.connect(str(self.db_path), isolation_level=None)
+        db.row_factory = aiosqlite.Row
+        transaction_started = False
+        try:
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("BEGIN IMMEDIATE")
+            transaction_started = True
+            reservation = await (
+                await db.execute(
+                    "SELECT projected_bytes FROM disk_reservations WHERE job_id=?",
+                    (job_id,),
+                )
+            ).fetchone()
+            if reservation is None:
+                await db.rollback()
+                transaction_started = False
+                return False
+            row = await (
+                await db.execute(
+                    "SELECT COALESCE(SUM(reserved_bytes),0) AS total "
+                    "FROM disk_reservations WHERE job_id<>?",
+                    (job_id,),
+                )
+            ).fetchone()
+            assert row is not None
+            available = max(
+                0,
+                int(free_bytes) - int(row["total"]) - max(0, int(safety_bytes)),
+            )
+            projected = max(actual_bytes, int(reservation["projected_bytes"]))
+            outstanding = max(0, projected - actual_bytes)
+            if maximum:
+                outstanding = min(outstanding, max(0, maximum - actual_bytes))
+                projected = actual_bytes + outstanding
+                if actual_bytes >= maximum:
+                    await db.execute(
+                        "UPDATE disk_reservations SET projected_bytes=?,actual_bytes=?,"
+                        "reserved_bytes=0 WHERE job_id=?",
+                        (actual_bytes, actual_bytes, job_id),
+                    )
+                    await db.commit()
+                    transaction_started = False
+                    return False
+            if outstanding > available:
+                await db.rollback()
+                transaction_started = False
+                return False
+
+            if outstanding <= max(1, extension_bytes // 2):
+                desired = extension_bytes
+                if maximum:
+                    desired = min(desired, max(0, maximum - actual_bytes))
+                extended = min(desired, available)
+                if extended <= outstanding and outstanding == 0:
+                    await db.rollback()
+                    transaction_started = False
+                    return False
+                outstanding = max(outstanding, extended)
+                projected = actual_bytes + outstanding
+
+            await db.execute(
+                "UPDATE disk_reservations SET projected_bytes=?,actual_bytes=?,"
+                "reserved_bytes=? WHERE job_id=?",
+                (projected, actual_bytes, outstanding, job_id),
+            )
+            await db.commit()
+            transaction_started = False
+            return True
+        except BaseException:
+            if transaction_started:
+                await db.rollback()
+            raise
+        finally:
+            await db.close()
 
     async def get_total_reserved_bytes(
         self, exclude_job_id: Optional[str] = None
@@ -1120,17 +1211,42 @@ class Database:
         )
         return dict(row)
 
+    async def get_cached_file_by_execution_identity(
+        self, execution_identity: str
+    ) -> Optional[dict[str, Any]]:
+        row = await (
+            await self.connection.execute(
+                "SELECT * FROM telegram_file_cache WHERE execution_identity=? "
+                "ORDER BY last_used_at DESC LIMIT 1",
+                (execution_identity,),
+            )
+        ).fetchone()
+        if not row:
+            return None
+        await self.connection.execute(
+            "UPDATE telegram_file_cache SET last_used_at=?,hit_count=hit_count+1 "
+            "WHERE output_identity=?",
+            (time.time(), row["output_identity"]),
+        )
+        return dict(row)
+
     async def save_cached_file(
-        self, output_identity: str, file_id: str, send_mode: str, output_container: str
+        self, output_identity: str, file_id: str, send_mode: str,
+        output_container: str, execution_identity: Optional[str] = None,
     ) -> None:
         now = time.time()
         await self.connection.execute(
             """INSERT INTO telegram_file_cache
-               (output_identity,telegram_file_id,send_mode,output_container,created_at,last_used_at,hit_count)
-               VALUES(?,?,?,?,?,?,0) ON CONFLICT(output_identity) DO UPDATE SET
+               (output_identity,telegram_file_id,send_mode,output_container,created_at,
+                last_used_at,hit_count,execution_identity)
+               VALUES(?,?,?,?,?,?,0,?) ON CONFLICT(output_identity) DO UPDATE SET
                telegram_file_id=excluded.telegram_file_id,send_mode=excluded.send_mode,
-               output_container=excluded.output_container,last_used_at=excluded.last_used_at""",
-            (output_identity, file_id, send_mode, output_container, now, now),
+               output_container=excluded.output_container,last_used_at=excluded.last_used_at,
+               execution_identity=excluded.execution_identity""",
+            (
+                output_identity, file_id, send_mode, output_container, now, now,
+                execution_identity,
+            ),
         )
 
     async def invalidate_cached_file(self, output_identity: str) -> None:
@@ -1241,7 +1357,7 @@ class Database:
             )).fetchone()
             delivered_any = delivered_any or bool(delivered)
             status = JobStatus.COMPLETED if delivered_any else JobStatus.FAILED
-            category = None if delivered_any else "telegram_delivery_failed"
+            category = None if delivered_any else ErrorCategory.TELEGRAM_DELIVERY_FAILED.value
             message = (
                 None if delivered_any else
                 "Telegram could not deliver the completed media. Please try again."

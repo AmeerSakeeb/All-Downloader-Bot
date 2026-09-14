@@ -143,6 +143,7 @@ class MediaFormat(BaseModel):
 
     # Raw metadata preservation (additive principle)
     raw_metadata: Dict[str, Any] = Field(default_factory=dict)
+    source_identity: Dict[str, Any] = Field(default_factory=dict)
 
     @property
     def is_exact_size(self) -> bool:
@@ -173,6 +174,7 @@ class MediaFormat(BaseModel):
                 "ext", "protocol", "is_video", "is_audio", "is_muxed",
                 "requires_separate_audio", "audio_language", "audio_is_default",
                 "audio_is_original", "filesize", "filesize_approx", "format_note",
+                "source_identity",
             )
         }
         identity["fingerprint"] = hashlib.sha256(

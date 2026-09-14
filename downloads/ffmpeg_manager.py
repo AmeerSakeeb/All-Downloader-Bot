@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from core.exceptions import DownloadError, StreamIncompatibleError
 from downloads.process_supervisor import ProcessSupervisor
@@ -81,7 +82,13 @@ class FFmpegManager:
         return data
 
     async def merge_streams(
-        self, video_path: Path, audio_path: Path, output_path: Path, *, job_id: str | None = None
+        self,
+        video_path: Path,
+        audio_path: Path,
+        output_path: Path,
+        *,
+        job_id: str | None = None,
+        growth_check: Callable[[], Awaitable[None] | None] | None = None,
     ) -> Path:
         video = self._local_file(video_path)
         audio = self._local_file(audio_path)
@@ -126,13 +133,30 @@ class FFmpegManager:
                 str(candidate),
             ]
             try:
-                result = await self.supervisor.run(
-                    command,
-                    job_id=job_id or output_parent.name,
-                    stage="merge",
-                    timeout=self.merge_timeout,
-                    max_output_bytes=self.max_diagnostic_bytes,
+                owner = job_id or output_parent.name
+                execution = asyncio.create_task(
+                    self.supervisor.run(
+                        command,
+                        job_id=owner,
+                        stage="merge",
+                        timeout=self.merge_timeout,
+                        max_output_bytes=self.max_diagnostic_bytes,
+                    )
                 )
+                try:
+                    while not execution.done():
+                        done, _ = await asyncio.wait({execution}, timeout=0.5)
+                        if execution in done:
+                            break
+                        if growth_check:
+                            checked = growth_check()
+                            if inspect.isawaitable(checked):
+                                await checked
+                    result = await execution
+                except BaseException:
+                    await self.supervisor.cancel_job(owner)
+                    await asyncio.gather(execution, return_exceptions=True)
+                    raise
                 if result.returncode != 0:
                     detail = result.stderr.decode("utf-8", errors="replace")[-1200:].strip()
                     failures.append(f"{container}: ffmpeg exit {result.returncode}: {detail}")

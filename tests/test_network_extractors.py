@@ -4,9 +4,13 @@ import json
 
 import pytest
 
-from core.exceptions import AuthenticationRequiredError, ExtractionTimeoutError
-from core.models import AudioCodec, VideoCodec
-from downloads.process_supervisor import ProcessResult
+from core.exceptions import (
+    AuthenticationRequiredError,
+    ExtractionError,
+    ExtractionTimeoutError,
+)
+from core.models import AudioCodec, MediaItem, VideoCodec
+from downloads.process_supervisor import ProcessOutputLimitError, ProcessResult
 from extractors.direct_extractor import DirectMediaExtractor
 from extractors.ytdlp_extractor import YtDlpExtractor
 from security.proxy import ControlledOutboundProxy
@@ -55,6 +59,92 @@ async def test_ytdlp_extractions_use_independent_operation_owners(monkeypatch, s
     await extractor.extract("https://example.com/a", 1, operation_id="analysis-a")
     await extractor.extract("https://example.com/b", 1, operation_id="analysis-b")
     assert supervisor.owners == ["analysis-a", "analysis-b"]
+
+
+def test_multimedia_image_prefers_direct_asset_url():
+    items = YtDlpExtractor._media_items(
+        {
+            "entries": [
+                {
+                    "id": "image-1",
+                    "ext": "jpg",
+                    "webpage_url": "https://example.com/post/123",
+                    "url": "https://cdn.example.com/image.jpg",
+                }
+            ]
+        },
+        parent_url="https://example.com/post/123",
+    )
+
+    assert items[0].kind == "image"
+    assert items[0].source_url == "https://cdn.example.com/image.jpg"
+    assert items[0].direct_source_url == "https://cdn.example.com/image.jpg"
+
+
+@pytest.mark.asyncio
+async def test_image_child_session_uses_direct_asset_url(media_session):
+    from bot.callbacks.phase2 import _extract_child_session
+
+    item = MediaItem(
+        kind="image",
+        source_url="https://example.com/post/123",
+        direct_source_url="https://cdn.example.com/image.jpg",
+        title="Photo",
+    )
+
+    child = await _extract_child_session(
+        media_session, item, media_session.user_id, None, None
+    )
+
+    assert child is not None
+    assert child.url == "https://cdn.example.com/image.jpg"
+
+
+@pytest.mark.asyncio
+async def test_ytdlp_metadata_overflow_is_reported_explicitly(monkeypatch, settings):
+    class Supervisor:
+        async def run(self, command, **kwargs):
+            assert kwargs["complete_stdout_limit"] == 32 * 1024 * 1024
+            raise ProcessOutputLimitError("stdout", kwargs["complete_stdout_limit"])
+
+    monkeypatch.setattr("extractors.ytdlp_extractor.SSRFGuard.validate_url", lambda url: [])
+    extractor = YtDlpExtractor(
+        settings=settings, supervisor=Supervisor(), proxy_url="http://proxy"
+    )
+
+    with pytest.raises(ExtractionError, match="bounded output limit"):
+        await extractor.extract("https://example.com/large-metadata", 1)
+
+
+@pytest.mark.asyncio
+async def test_extracted_url_validation_runs_in_worker_and_deduplicates_targets(
+    monkeypatch,
+):
+    calls = []
+    validations = []
+
+    async def fake_to_thread(function, candidates):
+        calls.append(function)
+        function(candidates)
+
+    monkeypatch.setattr("extractors.ytdlp_extractor.asyncio.to_thread", fake_to_thread)
+    monkeypatch.setattr(
+        "extractors.ytdlp_extractor.SSRFGuard.validate_url",
+        lambda url: validations.append(url),
+    )
+
+    await YtDlpExtractor._validate_extracted_urls(
+        {
+            "formats": [
+                {"url": "https://cdn.example.com/media?id=one"},
+                {"url": "https://cdn.example.com/media?id=two"},
+            ]
+        }
+    )
+
+    assert calls == [YtDlpExtractor._validate_url_candidates]
+    assert len(validations) == 1
+    assert validations[0].startswith("https://cdn.example.com/media?id=")
 
 
 @pytest.mark.asyncio

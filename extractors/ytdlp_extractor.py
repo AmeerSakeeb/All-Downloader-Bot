@@ -16,7 +16,7 @@ from core.exceptions import (
     ExtractionTimeoutError, SiteAccessChallengeError, UnsupportedUrlError,
 )
 from core.models import MediaAsset, MediaItem, MediaSession
-from downloads.process_supervisor import ProcessSupervisor
+from downloads.process_supervisor import ProcessOutputLimitError, ProcessSupervisor
 from extractors.format_manager import normalize_format_inventory
 from extractors.interface import Extractor
 from security.proxy import ControlledOutboundProxy
@@ -26,6 +26,7 @@ from services.ytdlp_policy import CookieFileUnavailableError, YtDlpPolicy
 from services.cookie_profiles import CookieProfiles, CookieProfileError
 
 logger = logging.getLogger(__name__)
+METADATA_STDOUT_LIMIT_BYTES = 32 * 1024 * 1024
 
 
 class YtDlpExtractor(Extractor):
@@ -87,6 +88,7 @@ class YtDlpExtractor(Extractor):
                         stage="extraction",
                         timeout=timeout_secs,
                         max_output_bytes=8 * 1024 * 1024,
+                        complete_stdout_limit=METADATA_STDOUT_LIMIT_BYTES,
                     )
                 except asyncio.TimeoutError as error:
                     self._log_attempt(
@@ -97,6 +99,16 @@ class YtDlpExtractor(Extractor):
                         impersonated = True
                         continue
                     raise ExtractionTimeoutError() from error
+                except ProcessOutputLimitError as error:
+                    self._log_attempt(
+                        url, attempt_type, returncode=None, timed_out=False,
+                        diagnostic="metadata response too large",
+                        category="extraction_failed",
+                    )
+                    raise ExtractionError(
+                        "yt-dlp metadata response exceeded the bounded output limit",
+                        user_message="The media metadata response is too large to process safely.",
+                    ) from error
                 if result.returncode == 0:
                     try:
                         metadata = json.loads(result.stdout.decode("utf-8"))
@@ -111,6 +123,7 @@ class YtDlpExtractor(Extractor):
                         url, attempt_type, returncode=0, timed_out=False,
                         diagnostic="", category="success",
                     )
+                    await self._validate_extracted_urls(metadata)
                     return self._build_session(
                         metadata, url, user_id, settings,
                         impersonated=impersonated, profile_name=profile_name,
@@ -170,7 +183,6 @@ class YtDlpExtractor(Extractor):
         self, metadata: dict[str, Any], url: str, user_id: int,
         settings: Settings, *, impersonated: bool, profile_name: str | None = None,
     ) -> MediaSession:
-        self._validate_extracted_urls(metadata)
         raw_formats = metadata.get("formats") or ([metadata] if metadata.get("url") else [])
         formats = normalize_format_inventory(raw_formats)
         items = self._media_items(metadata, parent_url=url)
@@ -311,7 +323,14 @@ class YtDlpExtractor(Extractor):
             direct_source_url = entry.get("url") or entry.get("original_url")
             ext = str(entry.get("ext") or "").lower()
             kind = "image" if ext in {"jpg", "jpeg", "png", "webp", "gif"} else "video"
-            source = webpage_url or (direct_source_url if kind == "image" else parent_url)
+            if (
+                kind == "image"
+                and isinstance(direct_source_url, str)
+                and direct_source_url.startswith(("http://", "https://"))
+            ):
+                source = direct_source_url
+            else:
+                source = webpage_url or parent_url
             if not isinstance(source, str) or not source.startswith(("http://", "https://")):
                 continue
             heights = [fmt.height for fmt in formats if fmt.is_video and fmt.height]
@@ -335,27 +354,52 @@ class YtDlpExtractor(Extractor):
             ))
         return items
 
+    @classmethod
+    async def _validate_extracted_urls(cls, metadata: dict[str, Any]) -> None:
+        candidates = cls._extracted_url_candidates(metadata)
+        await asyncio.to_thread(cls._validate_url_candidates, candidates)
+
     @staticmethod
-    def _validate_extracted_urls(metadata: dict[str, Any]) -> None:
-        candidates: list[str] = []
-        for key in ("url", "manifest_url", "fragment_base_url", "webpage_url", "original_url", "thumbnail"):
-            if isinstance(metadata.get(key), str):
-                candidates.append(metadata[key])
-        for item in metadata.get("formats") or []:
-            for key in ("url", "manifest_url", "fragment_base_url", "webpage_url", "original_url"):
-                if isinstance(item.get(key), str):
-                    candidates.append(item[key])
-        for item in metadata.get("thumbnails") or []:
-            if isinstance(item, dict) and isinstance(item.get("url"), str):
-                candidates.append(item["url"])
-        for key in ("subtitles", "automatic_captions"):
-            for tracks in (metadata.get(key) or {}).values():
-                for track in tracks or []:
-                    if isinstance(track, dict) and isinstance(track.get("url"), str):
-                        candidates.append(track["url"])
-        for entry in metadata.get("entries") or []:
-            if isinstance(entry, dict):
-                YtDlpExtractor._validate_extracted_urls(entry)
+    def _extracted_url_candidates(metadata: dict[str, Any]) -> list[str]:
+        candidates: dict[tuple[str, str, int | None], str] = {}
+        stack = [metadata]
+        while stack:
+            current = stack.pop()
+            values: list[str] = []
+            for key in (
+                "url", "manifest_url", "fragment_base_url", "webpage_url",
+                "original_url", "thumbnail",
+            ):
+                if isinstance(current.get(key), str):
+                    values.append(current[key])
+            for item in current.get("formats") or []:
+                if isinstance(item, dict):
+                    stack.append(item)
+            for item in current.get("thumbnails") or []:
+                if isinstance(item, dict) and isinstance(item.get("url"), str):
+                    values.append(item["url"])
+            for key in ("subtitles", "automatic_captions"):
+                for tracks in (current.get(key) or {}).values():
+                    for track in tracks or []:
+                        if isinstance(track, dict) and isinstance(track.get("url"), str):
+                            values.append(track["url"])
+            for entry in current.get("entries") or []:
+                if isinstance(entry, dict):
+                    stack.append(entry)
+            for candidate in values:
+                if not candidate.startswith(("http://", "https://")):
+                    continue
+                parsed = urlsplit(candidate)
+                try:
+                    port = parsed.port
+                except ValueError:
+                    candidates.setdefault(("invalid", candidate, None), candidate)
+                    continue
+                key = (parsed.scheme.lower(), (parsed.hostname or "").lower(), port)
+                candidates.setdefault(key, candidate)
+        return list(candidates.values())
+
+    @staticmethod
+    def _validate_url_candidates(candidates: list[str]) -> None:
         for candidate in candidates:
-            if candidate.startswith(("http://", "https://")):
-                SSRFGuard.validate_url(candidate)
+            SSRFGuard.validate_url(candidate)

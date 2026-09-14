@@ -73,6 +73,25 @@ class FileManager:
             raise SecurityError("Output path escaped the job directory")
         return candidate
 
+    def find_job_file(self, job_id: str, expected_filename: str) -> Path | None:
+        """Return a safe regular same-stem result from one isolated job directory."""
+        expected = self.get_job_file_path(job_id, expected_filename)
+        job_dir = expected.parent.resolve(strict=True)
+        if expected.is_file() and not self.is_link(expected):
+            return expected
+        with os.scandir(job_dir) as entries:
+            for entry in entries:
+                candidate = job_dir / entry.name
+                if (
+                    entry.is_file(follow_symlinks=False)
+                    and not self.is_link(candidate)
+                    and candidate.stem == expected.stem
+                    and candidate.suffix != ".part"
+                    and candidate.resolve(strict=True).parent == job_dir
+                ):
+                    return candidate
+        return None
+
     def job_disk_usage(self, job_id: str) -> int:
         job_dir = self.get_job_dir(job_id, create=False)
         total = 0

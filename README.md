@@ -5,8 +5,8 @@ A private Telegram bot that inventories source formats, lets an authorized user 
 ## Phase status
 
 - Phase 1 foundation: implemented, including allowlist administration, controlled outbound networking, persistent exact jobs, adaptive resource admission, restart recovery, durable cancellation and lossless stream-copy merging.
-- Phase 2 experience: implemented, including flexible favorite rules, preferred/all-format views, settings, source audio/assets, bounded collections/batches, exact Telegram `file_id` reuse, active-job coalescing and lightweight admin panels. Local tests do not certify every third-party site; Phase 3 review/hardening remains.
-- Phase 3: planned. Broader operations, observability, and deployment refinements are not implemented.
+- Phase 2 experience: implemented, including flexible favorite rules, preferred/all-format views, settings, source audio/assets, bounded collections/batches, exact Telegram `file_id` reuse, active-job coalescing and lightweight admin panels.
+- Phase 3: implemented and undergoing final independent review/private beta validation. The project is not released, and local checks do not certify every third-party site.
 
 ## Run
 

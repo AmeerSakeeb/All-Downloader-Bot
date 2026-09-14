@@ -51,3 +51,46 @@ def test_direct_source_command_never_uses_synthetic_format_selector(settings):
     )
     assert "-f" not in command and "direct" not in command
     assert "--proxy" in command and "--continue" in command
+
+
+def test_cookie_domains_config_parsing_and_validation(tmp_path):
+    from core.config import Settings
+    s = Settings(
+        bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        ytdlp_cookie_domains=" YouTube.com. , vimeo.com. ",
+    )
+    assert s.ytdlp_cookie_domains == ["youtube.com", "vimeo.com"]
+
+    with pytest.raises(ValueError):
+        Settings(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            ytdlp_cookie_domains="invalid_domain_name",
+        )
+
+
+def test_cookies_file_without_domains_raises(tmp_path):
+    from core.config import Settings
+    cookie_file = tmp_path / "cookies.txt"
+    cookie_file.write_text("# Netscape HTTP Cookie File\n")
+    with pytest.raises(ValueError, match="YTDLP_COOKIE_DOMAINS is empty"):
+        Settings(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            ytdlp_cookies_file=cookie_file,
+            ytdlp_cookie_domains="",
+        )
+
+
+def test_cookie_profile_source_and_cookie_domains_separation(tmp_path):
+    from services.cookie_profiles import CookieProfile
+    cookie_file = tmp_path / "cookies.txt"
+    profile = CookieProfile(
+        name="test",
+        source_domains=("youtube.com", "youtu.be"),
+        path=cookie_file,
+        cookie_domains=("youtube.com", ".google.com"),
+    )
+    assert profile.source_domains == ("youtube.com", "youtu.be")
+    assert profile.domains == ("youtube.com", "youtu.be")
+    assert profile.cookie_domains == ("youtube.com", ".google.com")
+    assert profile.matches("https://youtu.be/abc")
+    assert not profile.matches("https://google.com/abc")

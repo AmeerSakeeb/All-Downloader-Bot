@@ -2,5 +2,6 @@ services:
   bot:
     environment:
       YTDLP_COOKIES_FILE: /run/secrets/yt-dlp-cookies.txt
+      YTDLP_COOKIE_DOMAINS: youtube.com,youtu.be
     volumes:
       - ${YTDLP_COOKIES_HOST_PATH:?Set YTDLP_COOKIES_HOST_PATH}:/run/secrets/yt-dlp-cookies.txt:ro

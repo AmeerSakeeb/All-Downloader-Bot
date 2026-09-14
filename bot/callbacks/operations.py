@@ -98,7 +98,12 @@ async def operations(callback: CallbackQuery, db, application) -> None:
                     status = "configured ✓" if profiles.enabled(profile.name) else "disabled"
                 except CookieProfileError:
                     status = "file unavailable/invalid"
-                lines.append(f"\n<b>{escape(profile.name)}</b>: {status}\n{escape(', '.join(profile.domains))}\n<code>{escape(str(profile.path))}</code>")
+                lines.append(
+                    f"\nProfile: <b>{escape(profile.name)}</b>\n"
+                    f"Source domains: {escape(', '.join(profile.source_domains))}\n"
+                    f"Cookie-domain scope: {escape(', '.join(profile.cookie_domains))}\n"
+                    f"Status: {status}"
+                )
                 rows.append([(f"Enable/disable {profile.name}", "ops:toggle:" + profile.name)])
             if not profiles.profiles:
                 lines.append("No operator session profiles configured.")

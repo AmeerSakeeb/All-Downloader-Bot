@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from core.exceptions import ExactFormatUnavailableError
+from core.exceptions import ErrorCategory, ExactFormatUnavailableError
 from core.models import JobStatus
 from jobqueue.manager import QueueManager
 from jobqueue.scheduler import JobScheduler
@@ -22,6 +22,7 @@ class Governor:
         self.deny = set()
         self.released = []
         self.capacity = 2
+        self.reservations = []
 
     async def scheduler_capacity(self, running_jobs):
         return max(running_jobs, self.capacity)
@@ -30,6 +31,10 @@ class Governor:
         return (None, "pressure") if stage in self.deny else (Lease(), "Ready")
 
     async def reserve_job_disk(self, job_id, requested):
+        self.reservations.append((job_id, requested))
+        return True
+
+    async def growth_is_safe(self, job_id, actual):
         return True
 
     def disk_safety_bytes(self):
@@ -40,6 +45,7 @@ class Downloader:
     def __init__(self, manager):
         self.manager = manager
         self.names = []
+        self.actual_suffixes = {}
 
     async def download_format(
         self, job_id, url, format_id, output_filename, expected_size, progress, pid, stage,
@@ -47,13 +53,19 @@ class Downloader:
     ):
         self.names.append(output_filename)
         path = self.manager.get_job_file_path(job_id, output_filename)
+        if stage in self.actual_suffixes:
+            path = path.with_suffix(self.actual_suffixes[stage])
         path.write_bytes(b"stream")
         await progress(100, len(b"stream"), expected_size, 1, 0)
         return path
 
 
 class FFmpeg:
+    def __init__(self):
+        self.inputs = []
+
     async def merge_streams(self, video, audio, output, **kwargs):
+        self.inputs.append((video, audio))
         result = output.with_suffix(".mkv")
         result.write_bytes(video.read_bytes() + audio.read_bytes())
         return result
@@ -98,6 +110,44 @@ async def test_steel_thread_completes_and_preserves_file_id(
     assert completed.telegram_file_id == "real-file-id"
     assert uploads and downloader.names == ["video_stream.mp4", "audio_stream.m4a"]
     assert not any("137/unsafe-id" in name for name in downloader.names)
+
+
+@pytest.mark.asyncio
+async def test_actual_downloaded_stream_paths_reach_ffmpeg(
+    db, settings, media_session, video_format, audio_format
+):
+    scheduler, _, downloader, job, _ = await make_scheduler(
+        db, settings, media_session, video_format, audio_format
+    )
+    downloader.actual_suffixes = {
+        "download-video": ".webm",
+        "download-audio": ".opus",
+    }
+
+    assert await db.claim_job(job.job_id)
+    await scheduler.execute_job(job.job_id)
+
+    video_path, audio_path = scheduler.ffmpeg_mgr.inputs[0]
+    assert video_path.name == "video_stream.webm"
+    assert audio_path.name == "audio_stream.opus"
+
+
+@pytest.mark.asyncio
+async def test_merge_reservation_uses_actual_input_sizes(
+    db, settings, media_session, video_format, audio_format
+):
+    scheduler, governor, _, job, _ = await make_scheduler(
+        db, settings, media_session, video_format, audio_format
+    )
+
+    assert await db.claim_job(job.job_id)
+    await scheduler.execute_job(job.job_id)
+
+    input_bytes = len(b"stream") * 2
+    assert governor.reservations[-1] == (
+        job.job_id,
+        input_bytes + int(input_bytes * 1.1),
+    )
 
 
 @pytest.mark.asyncio
@@ -157,6 +207,58 @@ async def test_restart_reconciliation_requeues(
     await scheduler.queue_mgr.reconcile_on_startup()
     recovered = await db.get_job(job.job_id)
     assert recovered.status == JobStatus.QUEUED and recovered.process_pid is None
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciliation_preserves_failed_delivery_outcome(
+    db, settings, media_session, video_format, audio_format
+):
+    scheduler, _, _, job, _ = await make_scheduler(
+        db, settings, media_session, video_format, audio_format
+    )
+    recipient = (await db.list_job_subscribers(job.job_id))[0]
+    await db.mark_subscriber(recipient["subscriber_id"], "failed")
+    job.status = JobStatus.UPLOADING
+    await db.save_job(job)
+
+    await scheduler.queue_mgr.reconcile_on_startup()
+
+    recovered = await db.get_job(job.job_id)
+    assert recovered.status == JobStatus.FAILED
+    assert recovered.error_category == ErrorCategory.TELEGRAM_DELIVERY_FAILED.value
+    assert recovered.error_message == (
+        "Telegram could not deliver the completed media. Please try again."
+    )
+
+
+@pytest.mark.asyncio
+async def test_actual_oversize_file_fails_before_recipient_delivery(
+    db, settings, media_session, video_format
+):
+    muxed = video_format.model_copy(
+        update={"is_muxed": True, "requires_separate_audio": False}
+    )
+    scheduler, _, _, job, uploads = await make_scheduler(
+        db, settings, media_session, muxed, None
+    )
+
+    class TelegramSizePolicy:
+        @staticmethod
+        def can_deliver_selection(primary, audio):
+            return True, "OK"
+
+        @staticmethod
+        def can_deliver_size(size):
+            return False, "Actual output is too large"
+
+    scheduler.telegram_service = TelegramSizePolicy()
+    assert await db.claim_job(job.job_id)
+    await scheduler.execute_job(job.job_id)
+
+    failed = await db.get_job(job.job_id)
+    assert failed.status == JobStatus.FAILED
+    assert failed.error_category == ErrorCategory.DELIVERY_SIZE_EXCEEDED.value
+    assert uploads == []
 
 
 @pytest.mark.asyncio

@@ -126,6 +126,49 @@ async def test_atomic_disk_reservation(db, media_session, video_format, audio_fo
 
 
 @pytest.mark.asyncio
+async def test_disk_reservation_growth_extends_when_headroom_is_safe(
+    db, media_session, video_format
+):
+    await db.save_media_session(media_session)
+    job = await db.create_download_job(
+        session=media_session, video_format=video_format, audio_format=None, chat_id=1
+    )
+    assert await db.reserve_disk_atomic(job.job_id, 100, 1_000, 100)
+
+    assert await db.extend_disk_reservation_atomic(
+        job.job_id, 90, 900, 100, 100
+    )
+
+    row = await (
+        await db.connection.execute(
+            "SELECT projected_bytes,actual_bytes,reserved_bytes "
+            "FROM disk_reservations WHERE job_id=?",
+            (job.job_id,),
+        )
+    ).fetchone()
+    assert tuple(row) == (190, 90, 100)
+
+
+@pytest.mark.asyncio
+async def test_disk_reservation_growth_refuses_to_cross_headroom(
+    db, media_session, video_format
+):
+    await db.save_media_session(media_session)
+    first = await db.create_download_job(
+        session=media_session, video_format=video_format, audio_format=None, chat_id=1
+    )
+    second = await db.create_download_job(
+        session=media_session, video_format=video_format, audio_format=None, chat_id=2
+    )
+    assert await db.reserve_disk_atomic(first.job_id, 100, 1_000, 100)
+    assert await db.reserve_disk_atomic(second.job_id, 700, 1_000, 100)
+
+    assert not await db.extend_disk_reservation_atomic(
+        first.job_id, 100, 800, 100, 100
+    )
+
+
+@pytest.mark.asyncio
 async def test_list_queued_and_recovery_queries(db, media_session, video_format, audio_format):
     await db.save_media_session(media_session)
     job = await db.create_download_job(

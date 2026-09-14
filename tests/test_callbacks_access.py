@@ -40,6 +40,7 @@ class Callback:
 class Scheduler:
     def __init__(self):
         self.woken = False
+        self.paused = False
 
     def wake(self):
         self.woken = True
@@ -106,7 +107,12 @@ async def test_selection_rejects_transport_and_queue_limits(
     first = Callback(1, f"fmt:{media_session.session_id}:{video_format.internal_key}")
     limited = settings.model_copy(update={"max_queued_jobs_per_user": 1})
     await callback_format(first, db, scheduler, limited, service)
-    second = Callback(1, f"fmt:{media_session.session_id}:{video_format.internal_key}")
+    other_format = video_format.model_copy(update={"format_id": "138", "internal_key": "diffkey123"})
+    other_session = media_session.model_copy(
+        update={"session_id": "session_diff_queue_limit", "formats": [other_format, *media_session.formats[1:]]}
+    )
+    await db.save_media_session(other_session)
+    second = Callback(1, f"fmt:{other_session.session_id}:{other_format.internal_key}")
     await callback_format(second, db, scheduler, limited, service)
     assert "maximum number" in second.answers[-1][0]
     assert await db.count_total_active_jobs() == 1

@@ -9,7 +9,10 @@ from core.config import Settings
 from core.models import DownloadJob, MediaFormat, MediaSession
 from extractors.format_manager import select_default_audio
 from jobqueue.scheduler import JobScheduler
-from services.output_identity import build_output_identity
+from services.output_identity import (
+    build_completed_output_identity,
+    build_output_identity,
+)
 from services.telegram_api import TelegramService
 from storage.database import Database, QueueLimitError
 
@@ -40,7 +43,7 @@ async def submit_exact_selection(
     user = await db.get_user(user_id)
     if not user or not user["is_allowed"]:
         raise QueueLimitError("Your access to this bot has been revoked.")
-    if scheduler.paused:
+    if getattr(scheduler, "paused", False):
         raise QueueLimitError("New downloads are paused by the administrator. Please try later.")
     preferences = await db.get_user_settings(user_id)
     send_mode = preferences.send_mode if media_kind == "video" else "document"
@@ -57,8 +60,14 @@ async def submit_exact_selection(
         session, primary, audio, send_mode, media_kind=media_kind
     )
     async def deliver_cached() -> bool:
-        cached = await db.get_cached_file(identity)
+        cached = await db.get_cached_file_by_execution_identity(identity)
         if not cached:
+            return False
+        completed_identity = build_completed_output_identity(
+            identity, cached["output_container"]
+        )
+        if cached["output_identity"] != completed_identity:
+            await db.invalidate_cached_file(cached["output_identity"])
             return False
         try:
             await telegram_service.send_cached(
@@ -67,7 +76,7 @@ async def submit_exact_selection(
             )
             return True
         except Exception:
-            await db.invalidate_cached_file(identity)
+            await db.invalidate_cached_file(cached["output_identity"])
             return False
 
     # The partial unique job index, transactional subscriber admission and

@@ -25,13 +25,42 @@ def domain_matches(host: str, domain: str) -> bool:
 @dataclass(frozen=True)
 class CookieProfile:
     name: str
-    domains: tuple[str, ...]
+    source_domains: tuple[str, ...]
     path: Path
+    cookie_domains: tuple[str, ...] = ()
     enabled: bool = True
+
+    def __init__(
+        self,
+        name: str,
+        source_domains: tuple[str, ...] | list[str] = (),
+        path: Path | str = Path(""),
+        cookie_domains: tuple[str, ...] | list[str] | bool = (),
+        enabled: bool = True,
+        *,
+        domains: tuple[str, ...] | list[str] | None = None,
+    ):
+        if domains is not None and not source_domains:
+            source_domains = domains
+        if isinstance(cookie_domains, bool):
+            enabled = cookie_domains
+            cookie_domains = ()
+        src = tuple(source_domains) if isinstance(source_domains, (list, tuple)) else ()
+        ck = tuple(cookie_domains) if isinstance(cookie_domains, (list, tuple)) and cookie_domains else src
+        p = Path(path) if isinstance(path, str) else path
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "source_domains", src)
+        object.__setattr__(self, "path", p)
+        object.__setattr__(self, "cookie_domains", ck)
+        object.__setattr__(self, "enabled", bool(enabled))
+
+    @property
+    def domains(self) -> tuple[str, ...]:
+        return self.source_domains
 
     def matches(self, url: str) -> bool:
         host = (urlsplit(url).hostname or "").lower().rstrip(".")
-        return any(domain_matches(host, domain) for domain in self.domains)
+        return any(domain_matches(host, domain) for domain in self.source_domains)
 
     def validate_file(self) -> None:
         # Inspect locally only; errors must never quote a Netscape cookie line.
@@ -43,7 +72,7 @@ class CookieProfile:
                 warnings.simplefilter("ignore")
                 jar.load(ignore_discard=True, ignore_expires=True)
             if not jar or any(
-                not any(domain_matches(cookie.domain.lstrip(".").lower(), d) for d in self.domains)
+                not any(domain_matches(cookie.domain.lstrip(".").lower(), d) for d in self.cookie_domains)
                 for cookie in jar
             ):
                 raise ValueError
@@ -69,26 +98,54 @@ class CookieProfiles:
             if not isinstance(rows, list) or len(rows) > 20:
                 raise ValueError
             if self.settings.ytdlp_cookies_file:
-                rows.append({"name": "default", "domains": self.settings.ytdlp_cookie_domains,
-                             "path": str(self.settings.ytdlp_cookies_file)})
+                cookie_path = self.settings.ytdlp_cookies_file.resolve()
+                rows.append({
+                    "name": "default",
+                    "domains": list(self.settings.ytdlp_cookie_domains),
+                    "path": str(cookie_path),
+                })
             profiles = {}
+            domain_regex = re.compile(
+                r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$"
+            )
             for row in rows:
-                name = row["name"]
-                domains = row["domains"]
+                name = row.get("name")
                 if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9_-]{1,32}", name):
                     raise ValueError
-                if name in profiles or not isinstance(domains, list) or not domains or len(domains) > 12:
+                if name in profiles:
                     raise ValueError
-                if any(not isinstance(d, str) or not re.fullmatch(
-                    r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+", d
-                ) for d in domains):
+
+                source_raw = row.get("source_domains", row.get("domains"))
+                cookie_raw = row.get("cookie_domains")
+                if cookie_raw is None:
+                    cookie_raw = source_raw
+                if not isinstance(source_raw, list) or not source_raw or len(source_raw) > 12:
                     raise ValueError
+                if not isinstance(cookie_raw, list) or not cookie_raw or len(cookie_raw) > 12:
+                    raise ValueError
+
+                for d in source_raw:
+                    if not isinstance(d, str) or not domain_regex.fullmatch(d.strip().lower().rstrip(".")):
+                        raise ValueError
+                for d in cookie_raw:
+                    if not isinstance(d, str) or not domain_regex.fullmatch(d.strip().lower().rstrip(".")):
+                        raise ValueError
+
+                source_domains = tuple(d.strip().lower().rstrip(".") for d in source_raw)
+                cookie_domains = tuple(d.strip().lower().rstrip(".") for d in cookie_raw)
+
                 path = Path(row["path"])
                 if not path.is_absolute() or len(str(path)) > 240 or not isinstance(row.get("enabled", True), bool):
                     raise ValueError
                 if path.resolve().is_relative_to(self.settings.jobs_dir.resolve()):
                     raise ValueError
-                profiles[name] = CookieProfile(name, tuple(domains), path, row.get("enabled", True))
+                profiles[name] = CookieProfile(
+                    name=name,
+                    source_domains=source_domains,
+                    path=path,
+                    cookie_domains=cookie_domains,
+                    enabled=row.get("enabled", True),
+                )
             return profiles
         except Exception:
             raise CookieProfileError("Invalid session profile configuration; check names, domains and absolute paths") from None

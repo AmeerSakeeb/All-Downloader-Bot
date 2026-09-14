@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -38,6 +39,7 @@ from security.proxy import ControlledOutboundProxy
 from services.telegram_api import TelegramService
 from services.cookie_profiles import CookieProfiles
 from services.maintenance import MaintenanceService
+from services.output_identity import build_completed_output_identity
 from storage.database import Database
 from storage.file_manager import FileManager
 from ui.builders import build_progress_keyboard, build_progress_text
@@ -129,6 +131,11 @@ class BotApplication:
         async def upload(path: Path, job: DownloadJob) -> bool:
             assert self.telegram_service is not None
             telegram_file_id: Optional[str] = job.telegram_file_id
+            output_container = path.suffix.lower().lstrip(".") or "bin"
+            completed_identity = (
+                build_completed_output_identity(job.output_identity, output_container)
+                if job.output_identity else None
+            )
             delivered_any = False
             for subscriber in await self.db.list_job_subscribers(job.job_id):
                 if not await self.db.subscriber_is_waiting(subscriber["subscriber_id"]):
@@ -143,8 +150,8 @@ class BotApplication:
                             )
                         except Exception:
                             telegram_file_id = job.telegram_file_id = None
-                            if job.output_identity:
-                                await self.db.invalidate_cached_file(job.output_identity)
+                            if completed_identity:
+                                await self.db.invalidate_cached_file(completed_identity)
                     if not telegram_file_id:
                         delivery_job = job.model_copy(update={
                             "chat_id": subscriber["chat_id"],
@@ -160,10 +167,10 @@ class BotApplication:
                             raise RuntimeError("Telegram did not return a reusable file identifier")
                         telegram_file_id = delivery_job.telegram_file_id
                         job.telegram_file_id = telegram_file_id
-                        if job.output_identity:
+                        if completed_identity and job.output_identity:
                             await self.db.save_cached_file(
-                                job.output_identity, telegram_file_id, subscriber["send_mode"],
-                                path.suffix.lower().lstrip(".") or "bin",
+                                completed_identity, telegram_file_id, subscriber["send_mode"],
+                                output_container, execution_identity=job.output_identity,
                             )
                 except Exception:
                     logger.warning("Independent recipient delivery failed", exc_info=True)
@@ -320,9 +327,16 @@ class BotApplication:
                 time.time() - self.maintenance.last_success < self.settings.maintenance_interval_seconds + 120),
         })
         def write_atomic():
-            pending = self.health_file.with_suffix(".tmp")
+            self.health_file.parent.mkdir(parents=True, exist_ok=True)
+            pending = self.health_file.with_name(f"health_{os.getpid()}_{time.time_ns()}.tmp")
             pending.write_text(payload, encoding="utf-8")
-            pending.replace(self.health_file)
+            try:
+                pending.replace(self.health_file)
+            except OSError:
+                try:
+                    pending.unlink(missing_ok=True)
+                except OSError:
+                    pass
         await asyncio.to_thread(write_atomic)
 
     async def start(self) -> None:

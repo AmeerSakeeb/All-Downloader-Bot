@@ -7,14 +7,14 @@ from aiogram import Bot
 from aiogram.types import FSInputFile
 
 from core.config import SendMode, Settings, get_settings
-from core.exceptions import BotError
+from core.exceptions import BotError, ErrorCategory
 from core.models import DownloadJob, MediaFormat
 
 logger = logging.getLogger(__name__)
 
 
 class DeliverySizeError(BotError):
-    error_category = "delivery_size_exceeded"
+    error_category = ErrorCategory.DELIVERY_SIZE_EXCEEDED.value
 
 
 class TelegramService:

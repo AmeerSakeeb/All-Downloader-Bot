@@ -1,0 +1,13 @@
+services:
+  bot:
+    environment:
+      USE_LOCAL_API: "true"
+      LOCAL_API_BASE_URL: ${TELEGRAM_LOCAL_API_BASE_URL:-http://telegram-local-api:8081}
+    networks:
+      - default
+      - telegram_local_api
+
+networks:
+  telegram_local_api:
+    external: true
+    name: ${TELEGRAM_LOCAL_API_NETWORK:?Set TELEGRAM_LOCAL_API_NETWORK}

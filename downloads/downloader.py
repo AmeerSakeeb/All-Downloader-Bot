@@ -167,7 +167,7 @@ class Downloader:
                 f"yt-dlp failed with exit {process.returncode}: " +
                 ("<session diagnostic redacted>" if cookie_profile else self._redact_diagnostic(diagnostic))
             )
-        actual_path = self._find_downloaded_file(output_path)
+        actual_path = self.file_mgr.find_job_file(job_id, output_filename)
         if not actual_path:
             raise DownloadError("Download completed without a local output file")
         return actual_path
@@ -293,17 +293,3 @@ class Downloader:
             words = ["<url-redacted>" if word.startswith(("http://", "https://")) else word for word in line.split()]
             lines.append(" ".join(words))
         return sanitize_diagnostic("\n".join(lines))
-
-    @staticmethod
-    def _find_downloaded_file(expected: Path) -> Optional[Path]:
-        if expected.is_file() and not expected.is_symlink():
-            return expected
-        for candidate in expected.parent.iterdir():
-            if (
-                candidate.is_file()
-                and not candidate.is_symlink()
-                and candidate.stem == expected.stem
-                and candidate.suffix != ".part"
-            ):
-                return candidate
-        return None

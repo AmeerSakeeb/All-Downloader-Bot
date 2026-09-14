@@ -1,11 +1,14 @@
 """Configuration management using Pydantic Settings."""
 
 from enum import Enum
+import json
+import re
+
 from pathlib import Path
-from typing import List, Optional
+from typing import Annotated, List, Optional
 from pydantic import Field, field_validator, model_validator
 from urllib.parse import urlsplit
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class ResourceMode(str, Enum):
@@ -29,7 +32,7 @@ class Settings(BaseSettings):
 
     # Telegram Bot Configuration
     bot_token: str = Field(..., description="Telegram Bot Token")
-    admin_user_ids: List[int] = Field(
+    admin_user_ids: Annotated[List[int], NoDecode] = Field(
         default_factory=list,
         description="List of Telegram User IDs with admin privileges"
     )
@@ -37,12 +40,24 @@ class Settings(BaseSettings):
     @field_validator("admin_user_ids", mode="before")
     @classmethod
     def parse_admin_ids(cls, v):
+        if v is None:
+            return []
         if isinstance(v, str):
-            if not v.strip():
+            v = v.strip()
+            if not v:
                 return []
+            if v.startswith("[") and v.endswith("]"):
+                try:
+                    loaded = json.loads(v)
+                    if isinstance(loaded, list):
+                        return [int(uid) for uid in loaded if str(uid).strip()]
+                except Exception:
+                    pass
             return [int(uid.strip()) for uid in v.split(",") if uid.strip()]
         elif isinstance(v, (int, float)):
             return [int(v)]
+        elif isinstance(v, (list, tuple, set)):
+            return [int(uid) for uid in v if str(uid).strip()]
         return v
 
     # Resource Governor Configuration
@@ -75,7 +90,7 @@ class Settings(BaseSettings):
     ytdlp_impersonation_fallback: bool = Field(default=True)
     ytdlp_impersonate_target: str = Field(default="chrome", min_length=1, max_length=40)
     ytdlp_cookies_file: Optional[Path] = Field(default=None)
-    ytdlp_cookie_domains: List[str] = Field(default_factory=list)
+    ytdlp_cookie_domains: Annotated[List[str], NoDecode] = Field(default_factory=list)
     ytdlp_profiles_file: Optional[Path] = Field(default=None)
     max_collection_depth: int = Field(default=3, ge=1, le=8)
     maintenance_interval_seconds: int = Field(default=900, ge=60)
@@ -94,6 +109,44 @@ class Settings(BaseSettings):
         if value is None or (isinstance(value, str) and not value.strip()):
             return None
         return value
+
+    @field_validator("ytdlp_cookie_domains", mode="before")
+    @classmethod
+    def parse_cookie_domains(cls, value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return []
+            if value.startswith("[") and value.endswith("]"):
+                try:
+                    loaded = json.loads(value)
+                except json.JSONDecodeError as error:
+                    raise ValueError("Invalid JSON list in YTDLP_COOKIE_DOMAINS") from error
+                if not isinstance(loaded, list):
+                    raise ValueError("YTDLP_COOKIE_DOMAINS JSON value must be a list")
+                value = loaded
+            else:
+                value = value.split(",")
+        if isinstance(value, (list, tuple, set)):
+            parts = [str(p).strip().lower().rstrip(".") for p in value if str(p).strip()]
+        else:
+            return []
+
+        domain_re = re.compile(
+            r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$"
+        )
+        seen = set()
+        domains = []
+        for d in parts:
+            if not domain_re.match(d):
+                raise ValueError(f"Invalid domain in YTDLP_COOKIE_DOMAINS: {d}")
+            if d not in seen:
+                seen.add(d)
+                domains.append(d)
+        return domains
+
 
     @field_validator("ytdlp_impersonate_target")
     @classmethod
@@ -143,6 +196,12 @@ class Settings(BaseSettings):
         protected.extend(p for p in (self.ytdlp_cookies_file, self.ytdlp_profiles_file) if p)
         if any(path.resolve().is_relative_to(jobs) for path in protected):
             raise ValueError("Job storage must not contain the database, logs, backups or session secrets")
+        if self.ytdlp_cookies_file and not self.ytdlp_cookie_domains:
+            raise ValueError(
+                "YTDLP_COOKIES_FILE is configured but YTDLP_COOKIE_DOMAINS is empty. "
+                "Please set YTDLP_COOKIE_DOMAINS=youtube.com (or comma-separated domains)."
+            )
+
         return self
 
 

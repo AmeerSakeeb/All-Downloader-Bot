@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from core.exceptions import ErrorCategory
 from core.models import JobStatus
 from core.models import MediaFormat
 from downloads.process_supervisor import ProcessSupervisor
@@ -68,15 +69,36 @@ class QueueManager:
                     MediaFormat.model_validate(job.audio_format_snapshot)
                 recipients = await self.db.list_job_subscribers(job.job_id, ("waiting", "delivered", "failed", "cancelled"))
                 if recipients and not any(r["status"] == "waiting" for r in recipients):
-                    job.status = JobStatus.COMPLETED if any(r["status"] == "delivered" for r in recipients) else JobStatus.CANCELLED
-                    job.current_stage = "Recovered recipient outcome"
+                    if any(r["status"] == "delivered" for r in recipients):
+                        job.status = JobStatus.COMPLETED
+                        job.error_category = None
+                        job.error_message = None
+                    elif any(r["status"] == "failed" for r in recipients):
+                        job.status = JobStatus.FAILED
+                        job.error_category = ErrorCategory.TELEGRAM_DELIVERY_FAILED.value
+                        job.error_message = (
+                            "Telegram could not deliver the completed media. Please try again."
+                        )
+                    elif all(r["status"] == "cancelled" for r in recipients):
+                        job.status = JobStatus.CANCELLED
+                        job.error_category = None
+                        job.error_message = None
+                    else:
+                        job.status = JobStatus.QUEUED
+                    job.current_stage = (
+                        "Recovered recipient outcome"
+                        if job.status in {
+                            JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED
+                        }
+                        else "Recovered after restart"
+                    )
                 else:
                     job.status = JobStatus.QUEUED
                     job.current_stage = "Recovered after restart"
             except Exception:
                 job.status = JobStatus.FAILED
                 job.current_stage = "Recovery unavailable"
-                job.error_category = "download_failed"
+                job.error_category = ErrorCategory.DOWNLOAD_FAILED.value
                 job.error_message = "The interrupted download cannot be resumed safely. Send the link again."
             await self.db.save_job(job)
             await self.db.release_disk_reservation(job.job_id)

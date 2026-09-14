@@ -600,11 +600,12 @@ async def _extract_child_session(
     governor: ResourceGovernor,
 ) -> MediaSession | None:
     if item.kind == "image":
+        image_url = item.direct_source_url or item.source_url
         class Asset:
             asset_id = item.item_id
             kind = "image"
-            source_url = item.source_url
-            ext = item.source_url.split("?", 1)[0].rsplit(".", 1)[-1] or "jpg"
+            source_url = image_url
+            ext = image_url.split("?", 1)[0].rsplit(".", 1)[-1] or "jpg"
             label = item.title
             filesize = None
         return _asset_session(parent, Asset(), user_id)[0]

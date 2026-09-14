@@ -19,6 +19,15 @@ class ProcessResult:
     stderr: bytes
 
 
+class ProcessOutputLimitError(RuntimeError):
+    """Raised when semantic subprocess output cannot be retained completely."""
+
+    def __init__(self, stream_name: str, limit: int):
+        self.stream_name = stream_name
+        self.limit = limit
+        super().__init__(f"{stream_name} exceeded the complete-output limit of {limit} bytes")
+
+
 class _BoundedBytes:
     def __init__(self, limit: int):
         self.limit = max(1, limit)
@@ -33,6 +42,34 @@ class _BoundedBytes:
 
     def value(self) -> bytes:
         return b"".join(self.parts)[-self.limit :]
+
+
+class _CompleteBytes:
+    """Bounded prefix buffer that records overflow instead of returning partial data."""
+
+    def __init__(self, limit: int):
+        self.limit = max(1, limit)
+        self.parts: deque[bytes] = deque()
+        self.size = 0
+        self.overflowed = False
+
+    def append(self, data: bytes) -> None:
+        if self.overflowed:
+            return
+        remaining = self.limit - self.size
+        if len(data) > remaining:
+            if remaining:
+                self.parts.append(data[:remaining])
+                self.size += remaining
+            self.overflowed = True
+            return
+        self.parts.append(data)
+        self.size += len(data)
+
+    def value(self) -> bytes:
+        if self.overflowed:
+            raise ProcessOutputLimitError("stdout", self.limit)
+        return b"".join(self.parts)
 
 
 class ProcessSupervisor:
@@ -107,6 +144,7 @@ class ProcessSupervisor:
         stage: str = "process",
         timeout: float,
         max_output_bytes: int = 1024 * 1024,
+        complete_stdout_limit: Optional[int] = None,
     ) -> ProcessResult:
         process = await self.spawn_owned_process(
             cmd,
@@ -115,25 +153,43 @@ class ProcessSupervisor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout_buffer = _BoundedBytes(max_output_bytes)
+        stdout_buffer = (
+            _CompleteBytes(complete_stdout_limit)
+            if complete_stdout_limit is not None
+            else _BoundedBytes(max_output_bytes)
+        )
         stderr_buffer = _BoundedBytes(max_output_bytes)
+        stdout_overflow = asyncio.Event()
 
-        async def drain(stream: Optional[asyncio.StreamReader], target: _BoundedBytes) -> None:
+        async def drain(stream: Optional[asyncio.StreamReader], target) -> None:
             if stream is None:
                 return
             while chunk := await stream.read(65536):
                 target.append(chunk)
+                if isinstance(target, _CompleteBytes) and target.overflowed:
+                    stdout_overflow.set()
 
         readers = [
             asyncio.create_task(drain(process.stdout, stdout_buffer)),
             asyncio.create_task(drain(process.stderr, stderr_buffer)),
         ]
+        process_waiter = asyncio.create_task(process.wait())
+        overflow_waiter = asyncio.create_task(stdout_overflow.wait())
         try:
-            try:
-                await asyncio.wait_for(process.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
+            done, _ = await asyncio.wait(
+                {process_waiter, overflow_waiter},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
                 await self._terminate_handle(process)
-                raise
+                raise asyncio.TimeoutError
+            if overflow_waiter in done and stdout_overflow.is_set():
+                await self._terminate_handle(process)
+                await asyncio.gather(process_waiter, *readers, return_exceptions=True)
+                assert isinstance(stdout_buffer, _CompleteBytes)
+                raise ProcessOutputLimitError("stdout", stdout_buffer.limit)
+            await process_waiter
             await asyncio.gather(*readers)
             return ProcessResult(
                 process.returncode if process.returncode is not None else -1,
@@ -153,10 +209,12 @@ class ProcessSupervisor:
             raise
         finally:
             await self.reap_owned(job_id, stage, process)
-            for reader in readers:
-                if not reader.done():
-                    reader.cancel()
-            await asyncio.gather(*readers, return_exceptions=True)
+            for task in [process_waiter, overflow_waiter, *readers]:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                process_waiter, overflow_waiter, *readers, return_exceptions=True
+            )
             await self.unregister(job_id, stage, process)
 
     async def unregister(

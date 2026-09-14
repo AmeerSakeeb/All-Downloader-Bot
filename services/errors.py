@@ -1,13 +1,20 @@
 """Safe persisted messages for domain failures."""
 
-from core.exceptions import BotError
+from core.exceptions import BotError, ErrorCategory
 
 SAFE_USER_CATEGORIES = {
-    "authentication_required", "drm_unsupported", "media_unavailable",
-    "unsupported_url", "insufficient_disk", "lossless_merge_unavailable",
-    "exact_format_disappeared", "delivery_size_exceeded", "access_denied",
-    "telegram_delivery_failed",
-    "extraction_timeout", "site_access_challenge",
+    ErrorCategory.AUTHENTICATION_REQUIRED.value,
+    ErrorCategory.DRM_UNSUPPORTED.value,
+    ErrorCategory.MEDIA_UNAVAILABLE.value,
+    ErrorCategory.UNSUPPORTED_URL.value,
+    ErrorCategory.INSUFFICIENT_DISK.value,
+    ErrorCategory.LOSSLESS_MERGE_UNAVAILABLE.value,
+    ErrorCategory.EXACT_FORMAT_DISAPPEARED.value,
+    ErrorCategory.DELIVERY_SIZE_EXCEEDED.value,
+    ErrorCategory.ACCESS_DENIED.value,
+    ErrorCategory.TELEGRAM_DELIVERY_FAILED.value,
+    ErrorCategory.EXTRACTION_TIMEOUT.value,
+    ErrorCategory.SITE_ACCESS_CHALLENGE.value,
 }
 
 

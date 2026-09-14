@@ -1,12 +1,17 @@
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
 from core.exceptions import DownloadError, StreamIncompatibleError
 from downloads.ffmpeg_manager import FFmpegManager
-from downloads.process_supervisor import ProcessResult, ProcessSupervisor
+from downloads.process_supervisor import (
+    ProcessOutputLimitError,
+    ProcessResult,
+    ProcessSupervisor,
+)
 
 
 class FakeSupervisor:
@@ -121,3 +126,24 @@ async def test_process_term_wait_kill_and_reap(monkeypatch):
     process = Process()
     assert await supervisor._terminate_handle(process) == -9
     assert events == ["term", "kill"]
+
+
+@pytest.mark.asyncio
+async def test_complete_stdout_overflow_never_returns_truncated_json():
+    supervisor = ProcessSupervisor(terminate_grace_seconds=0.1)
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.write('{\"value\":\"' + 'x' * 256 + '\"}')",
+    ]
+
+    with pytest.raises(ProcessOutputLimitError, match="complete-output limit"):
+        await supervisor.run(
+            command,
+            job_id="metadata-test",
+            stage="extraction",
+            timeout=5,
+            max_output_bytes=16,
+            complete_stdout_limit=64,
+        )
+    assert supervisor.active_count == 0
