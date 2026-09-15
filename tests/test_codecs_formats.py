@@ -105,7 +105,7 @@ def test_format_details_show_estimated_combined_download():
     text = build_format_details_text(video, audio)
     assert "Video: ~9.5 MB" in text
     assert "Audio: ~2.4 MB" in text
-    assert "Expected download: ~11.9 MB" in text
+    assert "Total: ~11.9 MB" in text
 
 
 def test_batch_failures_use_safe_specific_categories():
@@ -118,9 +118,11 @@ def test_batch_failures_use_safe_specific_categories():
         ],
     )
     text = build_collection_text(session)
-    assert "❌ Analysis error" in text
-    assert "🛡 Site access challenge" in text
-    assert "🔐 Sign-in required" in text
+    assert "Analysis error" in text
+    assert "🛡 <b>TikTok</b>" in text
+    assert "Site blocked this server" in text
+    assert "🔐 <b>YouTube</b>" in text
+    assert "Sign-in required" in text
 
 
 def test_companion_audio_prefers_english(video_format, audio_format):

@@ -12,7 +12,7 @@ from resources.governor import ResourceGovernor
 from ui.builders import (
     build_admin_keyboard, build_admin_status_text, build_settings_keyboard,
     build_settings_text, build_home_keyboard, build_home_text,
-    build_queue_keyboard, build_queue_text,
+    build_queue_keyboard, build_queue_text, build_help_keyboard, build_help_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,24 +46,12 @@ async def cmd_start(
 
 
 @router.message(Command("help"))
-async def cmd_help(message: Message):
-    """Usage help and codec information."""
-    text = (
-        "📖 <b>Usage guide</b>\n"
-        "1. Paste a supported media link (or a small batch of links).\n"
-        "2. Choose Favorite Formats, Browse All Formats, or original Audio Only.\n"
-        "3. The bot downloads and, when needed, combines original streams without re-encoding.\n\n"
-        "⚙️ <b>Codec guide</b>\n"
-        "• H.264 / AVC: broadly compatible.\n"
-        "• H.265 / HEVC: efficient, with newer-player support.\n"
-        "• VP9 and AV1: efficient modern codecs.\n\n"
-        "⚙️ /settings controls send mode, Favorite rules and automatic/manual audio. "
-        "Playlists and multimedia posts offer item selection; subtitles and thumbnails remain optional original files.\n\n"
-        "Supports many public non-DRM sites through yt-dlp and direct media handling. "
-        "Some sites require an operator-configured authorized session. "
-        "DRM, paywall and access-control bypass are unsupported; website behavior can change."
+async def cmd_help(message: Message, user_db: dict):
+    """Open the same Help Center used by inline navigation."""
+    await message.reply(
+        build_help_text("main"),
+        reply_markup=build_help_keyboard("main", is_admin=bool(user_db.get("is_admin"))),
     )
-    await message.reply(text)
 
 
 @router.message(Command("settings"))
@@ -107,6 +95,17 @@ async def cmd_admin(
         build_admin_status_text(
             sample, stats, limits, governor.settings.resource_mode.value,
             scheduler.paused, governor.file_mgr.get_free_disk_space(),
+            getattr(getattr(scheduler, "telegram_service", None), "capabilities", None),
+            (
+                getattr(
+                    getattr(getattr(scheduler, "extractor_registry", None), "compatibility_overrides", None),
+                    "ytdlp_version", "unavailable",
+                ),
+                getattr(
+                    getattr(getattr(scheduler, "extractor_registry", None), "compatibility_overrides", None),
+                    "enabled_count", 0,
+                ),
+            ),
         ),
         reply_markup=build_admin_keyboard(scheduler.paused),
     )

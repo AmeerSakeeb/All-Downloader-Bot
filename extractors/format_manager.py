@@ -1,8 +1,10 @@
 """Format inventory normalization, companion audio selection, and size calculation."""
 
+import hashlib
 import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 from core.models import AudioCodec, MediaFormat, VideoCodec
 from extractors.codec_normalizer import normalize_audio_codec, normalize_video_codec
 
@@ -44,6 +46,38 @@ def _positive_number(value: Any) -> Optional[float]:
     return number if math.isfinite(number) and number > 0 else None
 
 
+def _optional_number(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    number = _optional_number(value)
+    return int(number) if number is not None and number >= 0 else None
+
+
+def _text(value: Any) -> Optional[str]:
+    return str(value) if value is not None and str(value).strip() else None
+
+
+def _resource_identity(raw: Dict[str, Any]) -> tuple[Optional[str], Dict[str, Any]]:
+    """Fingerprint extractor URLs without exposing signed resources in UI/snapshots."""
+    values = []
+    for key in ("url", "manifest_url", "fragment_base_url"):
+        value = raw.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        parsed = urlsplit(value)
+        values.append(urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", "")))
+    if not values:
+        return None, {}
+    digest = hashlib.sha256("\n".join(values).encode("utf-8")).hexdigest()
+    return digest, {"extractor_resource_fingerprint": digest}
+
+
 def _estimated_size_bytes(
     raw: Dict[str, Any], *, is_video: bool, is_audio: bool,
     duration: Any = None,
@@ -70,6 +104,7 @@ def _estimated_size_bytes(
 
 def normalize_format_inventory(
     raw_formats: List[Dict[str, Any]], *, duration: Any = None,
+    extractor_identity: str | None = None,
 ) -> List[MediaFormat]:
     """
     Additive normalization of all extractor-provided formats.
@@ -78,12 +113,18 @@ def normalize_format_inventory(
     normalized_list: List[MediaFormat] = []
 
     for raw in raw_formats:
-        format_id = str(raw.get("format_id", ""))
+        if not isinstance(raw, dict):
+            continue
+        raw_format_id = raw.get("format_id")
+        format_id = str(raw_format_id).strip() if raw_format_id is not None else ""
         if not format_id:
             continue
 
-        raw_vcodec = raw.get("vcodec")
-        raw_acodec = raw.get("acodec")
+        if raw.get("has_drm") is True or raw.get("drm_family"):
+            continue
+
+        raw_vcodec = _text(raw.get("vcodec"))
+        raw_acodec = _text(raw.get("acodec"))
 
         vcodec_norm, _ = normalize_video_codec(raw_vcodec)
         acodec_norm, _ = normalize_audio_codec(raw_acodec)
@@ -91,37 +132,67 @@ def normalize_format_inventory(
         is_video = vcodec_norm != VideoCodec.NONE
         is_audio = acodec_norm != AudioCodec.NONE
 
+        # A missing codec is unknown, while the literal value "none" means the
+        # extractor explicitly reported that stream type as absent. Retain
+        # incomplete genuine records when other parsed media fields establish
+        # their stream role.
+        video_ext_hint = (_text(raw.get("video_ext")) or "").lower()
+        audio_ext_hint = (_text(raw.get("audio_ext")) or "").lower()
+        if raw_vcodec is None and (
+            any(raw.get(key) is not None for key in ("width", "height", "resolution", "fps", "vbr"))
+            or video_ext_hint not in {"", "none"}
+        ):
+            is_video = True
+            vcodec_norm = VideoCodec.OTHER
+        if raw_acodec is None and (
+            any(raw.get(key) is not None for key in ("abr", "asr", "audio_channels"))
+            or audio_ext_hint not in {"", "none"}
+        ):
+            is_audio = True
+            acodec_norm = AudioCodec.OTHER
+        if not is_video and not is_audio and raw_vcodec is None and raw_acodec is None:
+            ext_hint = (_text(raw.get("ext")) or "").lower()
+            if isinstance(raw.get("url"), str) and raw["url"].startswith(("http://", "https://")):
+                if ext_hint in {"aac", "flac", "m4a", "mp3", "ogg", "opus", "wav"}:
+                    is_audio = True
+                    acodec_norm = AudioCodec.OTHER
+                else:
+                    is_video = True
+                    vcodec_norm = VideoCodec.OTHER
+
         if not is_video and not is_audio:
             continue
 
         is_muxed = is_video and is_audio
         requires_separate_audio = is_video and not is_audio
 
-        width = raw.get("width")
-        height = raw.get("height")
-        fps = raw.get("fps")
-        if fps:
-            try:
-                fps = round(float(fps), 2)
-            except (ValueError, TypeError):
-                fps = None
+        width = _optional_int(raw.get("width"))
+        height = _optional_int(raw.get("height"))
+        fps_value = _positive_number(raw.get("fps"))
+        fps = round(fps_value, 2) if fps_value is not None else None
 
         res_label = parse_resolution_label(height, width)
 
-        filesize = raw.get("filesize")
-        filesize_approx = raw.get("filesize_approx")
+        filesize = _optional_int(raw.get("filesize"))
+        filesize_approx = _optional_int(raw.get("filesize_approx"))
         if filesize is None and filesize_approx is None:
             filesize_approx = _estimated_size_bytes(
                 raw, is_video=is_video, is_audio=is_audio, duration=duration,
             )
-        audio_lang = raw.get("language") or raw.get("audio_language")
-        format_note = raw.get("format_note") or ""
+        audio_lang = _text(raw.get("language") or raw.get("audio_language"))
+        format_note = _text(raw.get("format_note")) or ""
+        manifest_identity, source_identity = _resource_identity(raw)
 
         is_default = bool(raw.get("is_default") or "default" in format_note.lower())
         is_original = bool(raw.get("is_original") or "original" in format_note.lower())
 
         fmt = MediaFormat(
             format_id=format_id,
+            extractor_identity=(
+                _text(raw.get("extractor") or raw.get("extractor_key") or raw.get("ie_key"))
+                or extractor_identity
+            ),
+            format_description=_text(raw.get("format")),
             is_video=is_video,
             is_audio=is_audio,
             is_muxed=is_muxed,
@@ -130,22 +201,31 @@ def normalize_format_inventory(
             vcodec_normalized=vcodec_norm,
             acodec_raw=raw_acodec,
             acodec_normalized=acodec_norm,
+            video_codec_profile=_text(raw.get("vcodec_profile") or raw.get("video_codec_profile")),
+            audio_codec_profile=_text(raw.get("acodec_profile") or raw.get("audio_codec_profile")),
             width=width,
             height=height,
             resolution_label=res_label,
             fps=fps,
-            vbr=raw.get("vbr"),
-            abr=raw.get("abr"),
-            tbr=raw.get("tbr"),
-            ext=raw.get("ext", "mp4"),
-            protocol=raw.get("protocol"),
+            vbr=_optional_number(raw.get("vbr")),
+            abr=_optional_number(raw.get("abr")),
+            tbr=_optional_number(raw.get("tbr")),
+            ext=_text(raw.get("ext")) or "unknown",
+            protocol=_text(raw.get("protocol")),
+            manifest_identity=manifest_identity,
+            dynamic_range=_text(raw.get("dynamic_range")),
+            quality=_optional_number(raw.get("quality")),
+            preference=_optional_number(raw.get("preference")),
+            source_preference=_optional_number(raw.get("source_preference")),
+            language_preference=_optional_number(raw.get("language_preference")),
             audio_language=audio_lang,
             audio_is_default=is_default,
             audio_is_original=is_original,
             filesize=filesize,
             filesize_approx=filesize_approx,
             format_note=format_note,
-            raw_metadata=raw
+            raw_metadata=raw,
+            source_identity=source_identity,
         )
         normalized_list.append(fmt)
 

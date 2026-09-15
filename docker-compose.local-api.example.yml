@@ -1,3 +1,8 @@
+# Optional override for an ALREADY RUNNING Telegram Local Bot API deployment.
+# This file does not create or start that server. Create the external network
+# separately, attach the Local Bot API service to it, and configure its service
+# URL below. The large-file ceiling activates only after Telegram getMe succeeds
+# through this transport.
 services:
   bot:
     environment:

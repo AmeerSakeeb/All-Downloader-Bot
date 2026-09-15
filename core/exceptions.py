@@ -10,6 +10,10 @@ class ErrorCategory(str, Enum):
     ACCESS_DENIED = "access_denied"
     EXTRACTION_FAILED = "extraction_failed"
     EXTRACTION_TIMEOUT = "extraction_timeout"
+    EXTRACTOR_COMPATIBILITY_FAILURE = "extractor_compatibility_failure"
+    NO_FORMATS = "no_formats"
+    NETWORK_FAILURE = "network_failure"
+    GEO_RESTRICTED = "geo_restricted"
     SITE_ACCESS_CHALLENGE = "site_access_challenge"
     UNSUPPORTED_URL = "unsupported_url"
     MEDIA_UNAVAILABLE = "media_unavailable"
@@ -22,6 +26,7 @@ class ErrorCategory(str, Enum):
     LOSSLESS_MERGE_UNAVAILABLE = "lossless_merge_unavailable"
     CANCELLED = "cancelled"
     DELIVERY_SIZE_EXCEEDED = "delivery_size_exceeded"
+    TELEGRAM_DELIVERY_UNAVAILABLE = "telegram_delivery_unavailable"
     TELEGRAM_DELIVERY_FAILED = "telegram_delivery_failed"
 
 
@@ -75,6 +80,46 @@ class ExtractionTimeoutError(ExtractionError):
         super().__init__(
             "All bounded media extraction attempts timed out",
             user_message="The website did not respond before the media-analysis timeout. Please try again later.",
+        )
+
+
+class ExtractorCompatibilityError(ExtractionError):
+    error_category: str = ErrorCategory.EXTRACTOR_COMPATIBILITY_FAILURE.value
+
+    def __init__(self):
+        super().__init__(
+            "The extractor could not parse otherwise reachable source metadata",
+            user_message="The website changed how this media is provided. Please try again later.",
+        )
+
+
+class NoFormatsError(ExtractionError):
+    error_category: str = ErrorCategory.NO_FORMATS.value
+
+    def __init__(self):
+        super().__init__(
+            "No genuine usable source formats were returned",
+            user_message="No downloadable source qualities were found.",
+        )
+
+
+class NetworkFailureError(ExtractionError):
+    error_category: str = ErrorCategory.NETWORK_FAILURE.value
+
+    def __init__(self):
+        super().__init__(
+            "The extractor transport failed",
+            user_message="The source network connection failed. Please try again later.",
+        )
+
+
+class GeoRestrictedError(ExtractionError):
+    error_category: str = ErrorCategory.GEO_RESTRICTED.value
+
+    def __init__(self):
+        super().__init__(
+            "The source reported a geographic restriction",
+            user_message="This media is not available from the bot's region.",
         )
 
 

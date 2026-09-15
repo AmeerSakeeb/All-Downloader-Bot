@@ -12,6 +12,8 @@ from extractors.interface import Extractor
 from extractors.ytdlp_extractor import YtDlpExtractor
 from security.proxy import ControlledOutboundProxy
 from services.cookie_profiles import CookieProfiles
+from services.compatibility import CompatibilityOverrideRegistry
+from services.site_policy import SitePolicyRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +27,15 @@ class ExtractorRegistry:
         supervisor: Optional[ProcessSupervisor] = None,
         proxy: Optional[ControlledOutboundProxy] = None,
         profiles: Optional[CookieProfiles] = None,
+        site_policies: Optional[SitePolicyRegistry] = None,
+        compatibility_overrides: Optional[CompatibilityOverrideRegistry] = None,
     ):
         self.settings = settings or get_settings()
         self.supervisor = supervisor or ProcessSupervisor()
         self.proxy = proxy
         self.profiles = profiles
+        self.site_policies = site_policies or SitePolicyRegistry()
+        self.compatibility_overrides = compatibility_overrides or CompatibilityOverrideRegistry()
 
     async def get_extractor_for_url(self, url: str) -> Extractor:
         """Return the appropriate extractor instance bound to application services."""
@@ -47,4 +53,6 @@ class ExtractorRegistry:
             supervisor=self.supervisor,
             proxy_url=proxy_url,
             profiles=self.profiles,
+            site_policies=self.site_policies,
+            compatibility_overrides=self.compatibility_overrides,
         )

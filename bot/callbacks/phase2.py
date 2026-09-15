@@ -9,7 +9,6 @@ from typing import Any, cast
 
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.batch_manager import global_batch_manager
 from core.config import ResourceMode, Settings
@@ -18,7 +17,7 @@ from core.models import (
     AudioCodec, DetailStyle, FavoriteFormatRule, MatchingStrategy, MediaFormat,
     MediaItem, MediaSession, VideoCodec,
 )
-from extractors.format_manager import select_default_audio
+from extractors.format_manager import calculate_total_download_size, select_default_audio
 from extractors.registry import ExtractorRegistry
 from jobqueue.scheduler import JobScheduler
 from resources.governor import ResourceGovernor
@@ -31,7 +30,7 @@ from storage.database import Database, QueueLimitError
 from ui.builders import (
     build_admin_keyboard, build_admin_status_text, build_all_formats_keyboard,
     build_all_formats_text,
-    build_assets_keyboard, build_audio_keyboard, build_collection_keyboard,
+    build_assets_keyboard, build_audio_keyboard, build_audio_text, build_collection_keyboard,
     build_collection_text, build_favorites_keyboard, build_favorites_text,
     build_filter_keyboard, build_format_details_keyboard, build_format_details_text,
     build_item_selection_keyboard, build_media_info_details, build_preferred_keyboard,
@@ -39,9 +38,14 @@ from ui.builders import (
     build_home_keyboard, build_home_text, build_performance_keyboard,
     build_performance_text, build_performance_advanced_keyboard,
     build_performance_advanced_text, build_queue_keyboard, build_queue_text,
-    build_rule_editor, build_settings_keyboard, build_settings_section_keyboard,
+    build_rule_editor, build_rule_delete_keyboard, build_settings_keyboard, build_settings_section_keyboard,
     build_settings_text, build_users_keyboard,
-    build_user_details, batch_item_status_text, format_button_label,
+    build_user_details, format_button_label,
+    build_batch_item_detail_keyboard, build_batch_item_detail_text,
+    build_batch_review_keyboard, build_batch_review_text,
+    build_help_keyboard, build_help_text, build_new_download_keyboard,
+    build_new_download_text, build_resource_text, build_search_keyboard,
+    build_delivery_limit_keyboard, build_delivery_limit_text,
 )
 
 router = Router(name="phase2-callbacks")
@@ -99,18 +103,18 @@ async def _render_submission(
         await message.edit_text(
             "🔗 <b>Joined an identical active download</b>\n\nYou will receive the exact output when ready.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-                text="❌ Cancel my delivery", callback_data=f"cancel_sub:{result.subscriber_id}"
+                text="❌ Cancel download", callback_data=f"cancel_sub:{result.subscriber_id}"
             )]]),
         )
     else:
         assert result.job
         position = await db.queue_position(result.job.job_id)
         await message.edit_text(
-            "⏳ <b>Queued</b>\n\nYour download is saved and will start automatically.\n"
+            "⏳ <b>Download queued</b>\n\nYour download is saved and will start automatically.\n"
             + (f"Position: {position}\n" if position else "")
             + "No resend required.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-                text="❌ Cancel my delivery", callback_data=f"cancel_sub:{result.subscriber_id}"
+                text="❌ Cancel download", callback_data=f"cancel_sub:{result.subscriber_id}"
             )]]),
         )
 
@@ -119,11 +123,26 @@ async def _submit(
     callback: CallbackQuery, db: Database, scheduler: JobScheduler,
     telegram_service: TelegramService, settings: Settings, session: MediaSession,
     primary: MediaFormat, audio: MediaFormat | None = None, media_kind: str = "video",
+    *, callback_answered: bool = False,
 ) -> None:
     if not callback.message:
         await callback.answer("The status message is unavailable.", show_alert=True)
         return
     message = cast(Any, callback.message)
+    allowed, reason = telegram_service.can_deliver_selection(primary, audio)
+    if not allowed:
+        total, exact = calculate_total_download_size(primary, audio)
+        await message.edit_text(
+            build_delivery_limit_text(
+                telegram_service.capabilities, total, estimated=not exact,
+            ),
+            reply_markup=build_delivery_limit_keyboard(session.session_id),
+        )
+        if not callback_answered:
+            await callback.answer(reason)
+        return
+    if not callback_answered:
+        await callback.answer("Preparing download…")
     try:
         result = await submit_exact_selection(
             db=db, scheduler=scheduler, telegram_service=telegram_service,
@@ -139,13 +158,17 @@ async def _submit(
                 [InlineKeyboardButton(text="🏠 Home", callback_data="home:show")],
             ]),
         )
-        await callback.answer(str(error), show_alert=True)
         return
     except ValueError as error:
-        await callback.answer(str(error), show_alert=True)
+        await message.edit_text(
+            "⌛ <b>This selection is no longer available</b>\n\n"
+            "Return to the video and choose a currently available source quality.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="↩️ Back to video", callback_data=f"preferred:{session.session_id}")
+            ]]),
+        )
         return
     await _render_submission(callback, result, db)
-    await callback.answer("Ready")
 
 
 @router.callback_query(F.data.startswith("preferred:"))
@@ -160,7 +183,10 @@ async def preferred(callback: CallbackQuery, db: Database) -> None:
 
 
 @router.callback_query(F.data.startswith(("detail:", "adetail:")))
-async def details(callback: CallbackQuery, db: Database) -> None:
+async def details(
+    callback: CallbackQuery, db: Database,
+    telegram_service: TelegramService | None = None,
+) -> None:
     parts = (callback.data or "").split(":")
     if len(parts) not in {3, 4}:
         return
@@ -182,6 +208,9 @@ async def details(callback: CallbackQuery, db: Database) -> None:
             build_format_details_text(
                 fmt, audio, preferences.detail_style.value,
                 manual_audio_required=manual_audio_required,
+                telegram_capabilities=(
+                    telegram_service.capabilities if telegram_service else None
+                ),
             ),
             reply_markup=build_format_details_keyboard(
                 session, fmt, back="all" if parts[0] == "adetail" else "preferred",
@@ -294,9 +323,32 @@ async def search_formats(callback: CallbackQuery, db: Database) -> None:
         "kind": "format_search", "session_id": session_id,
     })
     await cast(Any, callback.message).edit_text(
-        "🔎 <b>Search formats</b>\n\nSend a codec, resolution, FPS, container or exact format ID."
+        "🔎 <b>Search formats</b>\n\n"
+        "Send a codec, resolution, frame rate, container, or exact source format ID.\n\n"
+        "Examples: <code>1080</code>, <code>H.264</code>, <code>60 FPS</code>, or <code>MP4</code>.",
+        reply_markup=build_search_keyboard(session_id),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("searchclear:"))
+async def clear_format_search(callback: CallbackQuery, db: Database) -> None:
+    session_id = (callback.data or "").split(":", 1)[-1]
+    session = await _owned(callback, db, session_id)
+    if not session:
+        return
+    filters = await _filters(db, callback.from_user.id, session_id)
+    filters.pop("query", None)
+    await db.delete_ui_draft(callback.from_user.id, f"format_search:{session_id}")
+    await db.save_ui_draft(
+        callback.from_user.id, f"format_filters:{session_id}",
+        {"kind": "filters", "session_id": session_id, "filters": filters},
+    )
+    await cast(Any, callback.message).edit_text(
+        build_all_formats_text(session, filters, 0),
+        reply_markup=build_all_formats_keyboard(session, filters, 0),
+    )
+    await callback.answer("Search cleared")
 
 
 @router.callback_query(F.data.startswith("audio:"))
@@ -304,7 +356,7 @@ async def audio_only(callback: CallbackQuery, db: Database) -> None:
     session = await _owned(callback, db, (callback.data or "").split(":", 1)[-1])
     if session and callback.message:
         await cast(Any, callback.message).edit_text(
-            "🎵 <b>Audio Only</b>\n\nChoose an original source audio stream. No MP3 conversion occurs.",
+            build_audio_text(session),
             reply_markup=build_audio_keyboard(session),
         )
         await callback.answer()
@@ -317,7 +369,7 @@ async def audio_options(callback: CallbackQuery, db: Database) -> None:
         session = await _owned(callback, db, parts[1])
         if session and callback.message:
             await cast(Any, callback.message).edit_text(
-                "🎵 <b>Audio Options</b>\n\nChoose an exact genuine stream for lossless merge.",
+                build_audio_text(session, parts[2]),
                 reply_markup=build_audio_keyboard(session, parts[2]),
             )
             await callback.answer()
@@ -380,7 +432,7 @@ async def media_info(callback: CallbackQuery, db: Database) -> None:
         await cast(Any, callback.message).edit_text(
             build_media_info_details(session),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-                text="🔙 Back", callback_data=f"preferred:{session.session_id}"
+                text="↩️ Back to video", callback_data=f"preferred:{session.session_id}"
             )]]),
         )
         await callback.answer()
@@ -399,7 +451,11 @@ async def assets(callback: CallbackQuery, db: Database) -> None:
         await callback.answer("No source assets are available.", show_alert=True)
         return
     await cast(Any, callback.message).edit_text(
-        "🖼 <b>Source Thumbnails</b>" if parts[2] == "thumb" else "💬 <b>Source Subtitles</b>",
+        (
+            "🖼 <b>Source thumbnails</b>\n\nChoose an original image supplied by the website."
+            if parts[2] == "thumb" else
+            "💬 <b>Source subtitles</b>\n\nChoose a creator-provided or automatic subtitle file. No conversion occurs."
+        ),
         reply_markup=build_assets_keyboard(session, parts[2]),
     )
     await callback.answer()
@@ -435,10 +491,23 @@ async def asset_download(
     if not asset:
         await callback.answer("That source asset is unavailable.", show_alert=True)
         return
-    await asyncio.to_thread(SSRFGuard.validate_url, asset.source_url)
+    await callback.answer("Checking source asset…")
+    try:
+        await asyncio.to_thread(SSRFGuard.validate_url, asset.source_url)
+    except SecurityError:
+        await cast(Any, callback.message).edit_text(
+            "🔗 <b>This source asset cannot be used</b>\n\nThe address did not pass the bot's link safety checks.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="↩️ Back to video", callback_data=f"preferred:{parent.session_id}")
+            ]]),
+        )
+        return
     session, fmt = _asset_session(parent, asset, callback.from_user.id)
     await db.save_media_session(session)
-    await _submit(callback, db, scheduler, telegram_service, settings, session, fmt, media_kind="asset")
+    await _submit(
+        callback, db, scheduler, telegram_service, settings, session, fmt,
+        media_kind="asset", callback_answered=True,
+    )
 
 
 @router.callback_query((F.data == "settings") | F.data.startswith("settings:"))
@@ -499,16 +568,29 @@ async def settings_section(callback: CallbackQuery, db: Database) -> None:
     if not await _authorized(callback, db):
         return
     parts = (callback.data or "").split(":")
-    if len(parts) not in {2, 3} or parts[1] not in {"delivery", "audio", "workflow"}:
+    if len(parts) not in {2, 3} or parts[1] not in {"delivery", "audio", "strategy", "display", "workflow"}:
         return
     media_session_id = parts[2] if len(parts) == 3 else None
     if media_session_id and not await _owned(callback, db, media_session_id):
         return
     current = await db.get_user_settings(callback.from_user.id)
     labels = {
-        "delivery": "📦 <b>Delivery</b>\n\nChoose how unchanged media is sent.",
-        "audio": "🎵 <b>Audio</b>\n\nControl exact companion-audio selection.",
-        "workflow": "🎯 <b>Default Workflow</b>\n\nChoose matching and detail preferences.",
+        "delivery": (
+            "📦 <b>Delivery type</b>\n\nTelegram Video appears in the chat player when Telegram accepts the source file. "
+            "Telegram File sends it as a document. The media itself is not converted."
+        ),
+        "audio": (
+            "🎵 <b>Audio handling</b>\n\nAutomatic chooses a compatible original audio stream when video and audio are separate. "
+            "Manual asks you to choose the exact source audio stream."
+        ),
+        "strategy": (
+            "🎯 <b>Quality preference</b>\n\nBest quality prioritizes the highest matching source quality. "
+            "Smallest file prioritizes lower estimated size. Prefer ready-made video favors source files that already contain audio."
+        ),
+        "display": (
+            "🧾 <b>Display style</b>\n\nDetailed shows codec, size, and stream information. Compact keeps format menus shorter."
+        ),
+        "workflow": "🎯 <b>Quality preference</b>\n\nChoose how matching source formats are ordered.",
     }
     await cast(Any, callback.message).edit_text(
         labels[parts[1]],
@@ -540,8 +622,11 @@ async def favorite_add(callback: CallbackQuery, db: Database) -> None:
     rules = await db.list_favorite_rules(callback.from_user.id)
     rule = FavoriteFormatRule(user_id=callback.from_user.id, name=f"Rule {len(rules)+1}", priority=len(rules))
     await db.save_favorite_rule(rule)
-    await cast(Any, callback.message).edit_text(f"✏️ <b>{escape(rule.name)}</b>", reply_markup=build_rule_editor(rule))
-    await callback.answer("Rule added")
+    await cast(Any, callback.message).edit_text(
+        f"✏️ <b>{escape(rule.name)}</b>\n\nChoose which source formats this preferred rule should match.",
+        reply_markup=build_rule_editor(rule),
+    )
+    await callback.answer("Preferred rule added")
 
 
 @router.callback_query(F.data.startswith("fedit:"))
@@ -551,7 +636,7 @@ async def favorite_edit(callback: CallbackQuery, db: Database) -> None:
         await callback.answer("Rule unavailable.", show_alert=True)
         return
     await cast(Any, callback.message).edit_text(
-        f"✏️ <b>{escape(rule.name)}</b>\n\nChoose a category or rule action.",
+        f"✏️ <b>{escape(rule.name)}</b>\n\nChoose what this preferred rule should match, or manage the rule.",
         reply_markup=build_rule_editor(rule),
     )
     await callback.answer()
@@ -563,8 +648,9 @@ async def favorite_category(callback: CallbackQuery, db: Database) -> None:
     rule = await db.get_favorite_rule(parts[1], callback.from_user.id) if len(parts) == 3 else None
     if not rule or parts[2] not in {"codec", "resolution", "fps", "container"}:
         return
+    label = {"codec": "Codec", "resolution": "Resolution", "fps": "Frame rate", "container": "Container"}[parts[2]]
     await cast(Any, callback.message).edit_text(
-        f"✏️ <b>{parts[2].title()}</b>\n\nAny is mutually exclusive with specific values.",
+        f"✏️ <b>{label}</b>\n\nChoose Any, or select one or more specific values.",
         reply_markup=build_rule_choices(rule, parts[2]),
     )
     await callback.answer()
@@ -603,14 +689,19 @@ async def favorite_operation(callback: CallbackQuery, db: Database) -> None:
     if not rule:
         return
     action = parts[2]
+    if action == "delete":
+        await cast(Any, callback.message).edit_text(
+            f"🗑 <b>Delete {escape(rule.name)}?</b>\n\nThis removes the preferred-format rule. It does not affect existing downloads.",
+            reply_markup=build_rule_delete_keyboard(rule),
+        )
+        await callback.answer()
+        return
     if action == "dup":
         await db.duplicate_favorite_rule(rule.rule_id, rule.user_id)
     elif action == "toggle":
         await db.save_favorite_rule(rule.model_copy(update={"enabled": not rule.enabled}))
     elif action in {"up", "down"}:
         await db.reorder_favorite_rule(rule.rule_id, rule.user_id, -1 if action == "up" else 1)
-    elif action == "delete":
-        await db.delete_favorite_rule(rule.rule_id, rule.user_id)
     rules = await db.ensure_default_favorite_rules(callback.from_user.id)
     context = await db.get_ui_draft(callback.from_user.id, "favorites-context")
     media_session_id = str(context.get("media_session_id")) if context and context.get("media_session_id") else None
@@ -619,6 +710,37 @@ async def favorite_operation(callback: CallbackQuery, db: Database) -> None:
         reply_markup=build_favorites_keyboard(rules, media_session_id),
     )
     await callback.answer("Updated")
+
+
+@router.callback_query(F.data.startswith("fdelete:"))
+async def favorite_delete_prompt(callback: CallbackQuery, db: Database) -> None:
+    rule = await db.get_favorite_rule((callback.data or "").split(":", 1)[-1], callback.from_user.id)
+    if not rule or not await _authorized(callback, db):
+        await callback.answer("Rule unavailable.", show_alert=True)
+        return
+    await cast(Any, callback.message).edit_text(
+        f"🗑 <b>Delete {escape(rule.name)}?</b>\n\nThis removes the preferred-format rule. It does not affect existing downloads.",
+        reply_markup=build_rule_delete_keyboard(rule),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("fdeleteconfirm:"))
+async def favorite_delete_confirm(callback: CallbackQuery, db: Database) -> None:
+    rule_id = (callback.data or "").split(":", 1)[-1]
+    rule = await db.get_favorite_rule(rule_id, callback.from_user.id)
+    if not rule or not await _authorized(callback, db):
+        await callback.answer("Rule unavailable.", show_alert=True)
+        return
+    await db.delete_favorite_rule(rule.rule_id, rule.user_id)
+    rules = await db.ensure_default_favorite_rules(callback.from_user.id)
+    context = await db.get_ui_draft(callback.from_user.id, "favorites-context")
+    media_session_id = str(context.get("media_session_id")) if context and context.get("media_session_id") else None
+    await cast(Any, callback.message).edit_text(
+        build_favorites_text(rules),
+        reply_markup=build_favorites_keyboard(rules, media_session_id),
+    )
+    await callback.answer("Rule deleted")
 
 
 @router.callback_query(F.data.startswith("cancel_sub:"))
@@ -751,14 +873,15 @@ async def prepare_download_all(
     session = await _owned(callback, db, (callback.data or "").split(":", 1)[-1])
     if not session or not callback.message:
         return
+    await callback.answer("Preparing ready downloads…")
     batch_manager = global_batch_manager
     preferences = await db.get_user_settings(callback.from_user.id)
     rules = await db.ensure_default_favorite_rules(callback.from_user.id)
     choices: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
     lines = [
-        "📦 <b>Download All Media</b>", "",
-        "Configured Favorite rules determine each exact video stream.", "",
+        "⬇️ <b>Prepare downloads</b>", "",
+        "Preferred-format rules choose an exact source quality for each ready item.", "",
     ]
     for index, item in enumerate(session.items, 1):
         if session.session_kind == "batch":
@@ -777,7 +900,7 @@ async def prepare_download_all(
                 lines.append(f"{index}. ⏳ Waiting for analysis")
                 continue
             else:
-                lines.append(f"{index}. ❌ Analysis failed")
+                lines.append(f"{index}. ⚠️ Needs attention")
                 continue
         else:
             child = await _child_session(
@@ -811,7 +934,7 @@ async def prepare_download_all(
                 "session_id": child.session_id, "title": item.title,
                 "reason": "format",
             })
-            lines.append(f"{index}. 🎞 Format selection required")
+            lines.append(f"{index}. 🎞 Choose a video quality")
             continue
         audio = None
         if primary.requires_separate_audio:
@@ -822,7 +945,7 @@ async def prepare_download_all(
                     "session_id": child.session_id, "title": item.title,
                     "reason": "audio", "primary_key": primary.internal_key,
                 })
-                lines.append(f"{index}. 🎞 Audio selection required")
+                lines.append(f"{index}. 🎵 Choose source audio")
                 continue
         choices.append({
             "session_id": child.session_id, "primary_key": primary.internal_key,
@@ -838,19 +961,20 @@ async def prepare_download_all(
     buttons: list[list[InlineKeyboardButton]] = []
     if choices:
         buttons.append([InlineKeyboardButton(
-            text="▶️ Queue available items", callback_data=f"allqueue:{session.session_id}"
+            text=f"⬇️ Queue {len(choices)} ready download{'s' if len(choices) != 1 else ''}",
+            callback_data=f"allqueue:{session.session_id}"
         )])
     if missing:
         buttons.append([InlineKeyboardButton(
-            text="🎞 Choose missing formats", callback_data=f"allmissing:{session.session_id}"
+            text=f"🎞 Choose {len(missing)} missing selection{'s' if len(missing) != 1 else ''}",
+            callback_data=f"allmissing:{session.session_id}"
         )])
     buttons.append([InlineKeyboardButton(
-        text="❌ Cancel", callback_data=f"allcancel:{session.session_id}"
+        text="↩️ Back to batch", callback_data=f"allcancel:{session.session_id}"
     )])
     await cast(Any, callback.message).edit_text(
         "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
-    await callback.answer("Exact selections prepared")
 
 
 @router.callback_query(F.data.startswith("allmissing:"))
@@ -862,6 +986,7 @@ async def choose_missing_formats(callback: CallbackQuery, db: Database) -> None:
     if not draft or draft.get("kind") != "download_all" or draft.get("session_id") != session_id:
         await callback.answer("This confirmation has expired.", show_alert=True)
         return
+    await callback.answer("Opening selection panels…")
     for missing in draft.get("missing") or []:
         child = await db.get_media_session(str(missing.get("session_id") or ""))
         if not child or child.user_id != callback.from_user.id or child.is_expired():
@@ -878,7 +1003,6 @@ async def choose_missing_formats(callback: CallbackQuery, db: Database) -> None:
         else:
             text, markup = await _preferred(child, db)
             await cast(Any, callback.message).answer(text, reply_markup=markup)
-    await callback.answer("Selection panels opened")
 
 
 @router.callback_query(F.data.startswith("allqueue:"))
@@ -893,6 +1017,7 @@ async def queue_download_all(
     if not draft or draft.get("kind") != "download_all" or draft.get("session_id") != session_id:
         await callback.answer("This confirmation has expired.", show_alert=True)
         return
+    await callback.answer("Queueing downloads…")
     queued = 0
     failed = 0
     message = cast(Any, callback.message)
@@ -921,7 +1046,7 @@ async def queue_download_all(
                 await status_message.edit_text(
                     f"⏳ <b>{label}</b>",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-                        text="❌ Cancel my delivery", callback_data=f"cancel_sub:{result.subscriber_id}"
+                        text="❌ Cancel download", callback_data=f"cancel_sub:{result.subscriber_id}"
                     )]]),
                 )
             queued += 1
@@ -930,18 +1055,26 @@ async def queue_download_all(
             await status_message.edit_text("❌ This exact item could not be queued.")
     await db.delete_ui_draft(callback.from_user.id, f"download-all:{session_id}")
     await message.edit_text(
-        f"📦 <b>Download All Media</b>\n\nQueued/delivered: {queued}\nNot queued: {failed}"
+        f"✅ <b>Batch downloads prepared</b>\n\nQueued or delivered: {queued}\nNot queued: {failed}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 My downloads", callback_data="queue:mine")],
+            [InlineKeyboardButton(text="🏠 Home", callback_data="home:show")],
+        ]),
     )
-    await callback.answer("Available exact selections processed")
 
 
 @router.callback_query(F.data.startswith("allcancel:"))
 async def cancel_download_all(callback: CallbackQuery, db: Database) -> None:
     session_id = (callback.data or "").split(":", 1)[-1]
     await db.delete_ui_draft(callback.from_user.id, f"download-all:{session_id}")
+    session = await _owned(callback, db, session_id)
+    if not session:
+        return
     if callback.message:
-        await cast(Any, callback.message).edit_text("Download All Media cancelled.")
-    await callback.answer("Cancelled")
+        await cast(Any, callback.message).edit_text(
+            build_collection_text(session), reply_markup=build_collection_keyboard(session)
+        )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("item:"))
@@ -969,7 +1102,7 @@ async def collection_item(
                     f"🖼 <b>{escape(item.title)}</b>\n\nOriginal image source; no re-encoding.",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
                         text="⬇️ Download original", callback_data=f"assetfmt:{child.session_id}:{fmt.internal_key}"
-                    )], [InlineKeyboardButton(text="🔙 Back", callback_data=f"collection:{parent.session_id}")]]),
+                    )], [InlineKeyboardButton(text="↩️ Back to batch", callback_data=f"collection:{parent.session_id}")]]),
                 )
             elif child.items:
                 await cast(Any, callback.message).edit_text(
@@ -980,19 +1113,20 @@ async def collection_item(
                 await cast(Any, callback.message).edit_text(text, reply_markup=markup)
             await callback.answer()
             return
-        if item.analysis_status == "analyzing":
-            await callback.answer("This item is still being analyzed.", show_alert=True)
-            return
-        if item.analysis_status == "waiting":
-            await callback.answer("This item is waiting for analysis.", show_alert=True)
-            return
-        await callback.answer("Analysis failed for this item.", show_alert=True)
+        await cast(Any, callback.message).edit_text(
+            build_batch_item_detail_text(item),
+            reply_markup=build_batch_item_detail_keyboard(parent, item),
+        )
+        await callback.answer()
         return
+    await callback.answer("Preparing item…")
     child = await _child_session(parent, item, callback.from_user.id, extractor_registry, governor)
     if not child:
-        await callback.answer(
-            "This item is unavailable or the configured nesting limit was reached.",
-            show_alert=True,
+        await cast(Any, callback.message).edit_text(
+            "⚠️ <b>This item could not be prepared</b>\n\nIt may be unavailable, or the collection nesting limit was reached.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="↩️ Back to collection", callback_data=f"collection:{parent.session_id}")
+            ]]),
         )
         return
     await db.save_media_session(child)
@@ -1003,7 +1137,7 @@ async def collection_item(
             f"🖼 <b>{escape(item.title)}</b>\n\nOriginal image source; no re-encoding.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
                 text="⬇️ Download original", callback_data=f"assetfmt:{child.session_id}:{fmt.internal_key}"
-            )], [InlineKeyboardButton(text="🔙 Back", callback_data=f"collection:{parent.session_id}")]]),
+            )], [InlineKeyboardButton(text="↩️ Back to collection", callback_data=f"collection:{parent.session_id}")]]),
         )
     elif child.items:
         await cast(Any, callback.message).edit_text(
@@ -1012,42 +1146,77 @@ async def collection_item(
     else:
         text, markup = await _preferred(child, db)
         await cast(Any, callback.message).edit_text(text, reply_markup=markup)
-    await callback.answer()
 
 
-def _build_review_text(session: MediaSession) -> str:
-    lines = []
-    for index, item in enumerate(session.items, 1):
-        state = batch_item_status_text(item)
-        lines.append(f"{index}. {escape(item.title)} — {state}")
-    return "\n".join(lines)
+@router.callback_query(F.data.startswith("batchretry:"))
+async def retry_batch_item(
+    callback: CallbackQuery, db: Database, extractor_registry: ExtractorRegistry,
+    governor: ResourceGovernor,
+) -> None:
+    parts = (callback.data or "").split(":")
+    parent = await _owned(callback, db, parts[1]) if len(parts) == 3 else None
+    item = next((entry for entry in parent.items if entry.item_id == parts[2]), None) if parent else None
+    if not parent or not item:
+        return
+    if parent.session_kind != "batch" or item.analysis_status != "failed":
+        await callback.answer("This item no longer needs another analysis.", show_alert=True)
+        return
+    await callback.answer("Trying analysis again…")
+    item.analysis_status = "analyzing"
+    item.analysis_error_category = None
+    await db.save_media_session(parent)
+    await cast(Any, callback.message).edit_text(
+        build_batch_item_detail_text(item),
+        reply_markup=build_batch_item_detail_keyboard(parent, item),
+    )
+    try:
+        lease, _ = await governor.acquire_stage("extraction")
+        while lease is None:
+            await asyncio.sleep(max(1.0, min(10.0, governor.settings.scheduler_retry_seconds)))
+            lease, _ = await governor.acquire_stage("extraction")
+        async with lease:
+            await asyncio.to_thread(SSRFGuard.validate_url, item.source_url)
+            extractor = await extractor_registry.get_extractor_for_url(item.source_url)
+            child = await extractor.extract(
+                item.source_url,
+                callback.from_user.id,
+                operation_id=f"batch-retry-{parent.session_id}-{item.item_id}-{uuid.uuid4().hex}",
+            )
+        item.title = child.title or item.title
+        item.formats = child.formats
+        item.thumbnail_url = child.thumbnail_url
+        item.duration = child.duration
+        item.extractor_id = child.media_id
+        item.source_extractor = child.extractor
+        item.analysis_status = "ready"
+        item.analysis_error_category = None
+    except BotError as error:
+        item.analysis_status = "failed"
+        item.analysis_error_category = getattr(error, "error_category", "media_unavailable")
+    except Exception:
+        logger.exception("Explicit batch item retry failed")
+        item.analysis_status = "failed"
+        item.analysis_error_category = "unexpected_error"
+    await db.save_media_session(parent)
+    if item.analysis_status == "ready":
+        child = _batch_ready_child(parent, item, callback.from_user.id)
+        if child:
+            await db.save_media_session(child)
+            text, markup = await _preferred(child, db)
+            await cast(Any, callback.message).edit_text(text, reply_markup=markup)
+            return
+    await cast(Any, callback.message).edit_text(
+        build_batch_item_detail_text(item),
+        reply_markup=build_batch_item_detail_keyboard(parent, item),
+    )
+
+
+def _build_review_text(session: MediaSession, selected: set[str] | None = None) -> str:
+    return build_batch_review_text(session, selected or set())
 
 
 def _build_review_keyboard(session: MediaSession, selected: set[str] | None = None) -> InlineKeyboardMarkup:
-    selected = selected or set()
-    builder = InlineKeyboardBuilder()
-    for item in session.items:
-        if item.analysis_status == "ready":
-            if item.item_id in selected:
-                builder.button(
-                    text=f"☑ {item.item_id[:6]}",
-                    callback_data=f"itoggle:{session.session_id}:{item.item_id}:0",
-                )
-            else:
-                builder.button(
-                    text=f"☐ {item.item_id[:6]}",
-                    callback_data=f"itoggle:{session.session_id}:{item.item_id}:0",
-                )
-        else:
-            builder.button(
-                text=f"🔒 {item.item_id[:6]}",
-                callback_data=f"noop",
-            )
-    builder.adjust(2)
-    builder.row(InlineKeyboardButton(text="▶️ Process Selected", callback_data=f"iprocess:{session.session_id}"))
-    builder.row(InlineKeyboardButton(text="🔄 Refresh", callback_data=f"iselect:{session.session_id}:refresh"))
-    builder.row(InlineKeyboardButton(text="↩️ Back to Batch", callback_data=f"iselect:{session.session_id}:back"))
-    return builder.as_markup()
+    return build_batch_review_keyboard(session, selected or set())
 
 
 @router.callback_query(F.data.startswith("iselect:"))
@@ -1078,7 +1247,7 @@ async def select_items(callback: CallbackQuery, db: Database) -> None:
         )
         selected = set((selection_draft or {}).get("selected") or [])
         await cast(Any, callback.message).edit_text(
-            "🔎 <b>Review Items</b>\n\n" + _build_review_text(session),
+            _build_review_text(session, selected),
             reply_markup=_build_review_keyboard(session, selected),
         )
         await callback.answer()
@@ -1096,7 +1265,7 @@ async def select_items(callback: CallbackQuery, db: Database) -> None:
         )
         selected = set(draft.get("selected") or [])
         await cast(Any, callback.message).edit_text(
-            "🔎 <b>Review Items</b>\n\n" + _build_review_text(session),
+            _build_review_text(session, selected),
             reply_markup=_build_review_keyboard(session, selected),
         )
         await callback.answer()
@@ -1160,7 +1329,7 @@ async def item_toggle(callback: CallbackQuery, db: Database) -> None:
             {"view": "review"},
         )
         await cast(Any, callback.message).edit_text(
-            "🔎 <b>Review Items</b>\n\n" + _build_review_text(session),
+            _build_review_text(session, set(selected)),
             reply_markup=_build_review_keyboard(session, set(selected)),
         )
         await callback.answer()
@@ -1183,6 +1352,7 @@ async def process_selected(
     if not session or not selected:
         await callback.answer("Select at least one item.", show_alert=True)
         return
+    await callback.answer("Preparing selected items…")
     await cast(Any, callback.message).edit_text(
         "📚 <b>Preparing selected items</b>\n\nEach video keeps its own exact-format workflow."
     )
@@ -1230,7 +1400,13 @@ async def process_selected(
             text, markup = await _preferred(child, db)
             await cast(Any, callback.message).answer(text, reply_markup=markup)
     await db.delete_ui_draft(callback.from_user.id, draft_key)
-    await callback.answer("Prepared")
+    await cast(Any, callback.message).edit_text(
+        "✅ <b>Selected items prepared</b>\n\nUse the format panels sent below to continue.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 My downloads", callback_data="queue:mine")],
+            [InlineKeyboardButton(text="🏠 Home", callback_data="home:show")],
+        ]),
+    )
 
 
 async def _show_admin(
@@ -1243,6 +1419,17 @@ async def _show_admin(
     text = build_admin_status_text(
         sample, stats, limits, governor.settings.resource_mode.value,
         scheduler.paused, governor.file_mgr.get_free_disk_space(),
+        getattr(getattr(scheduler, "telegram_service", None), "capabilities", None),
+        (
+            getattr(
+                getattr(getattr(scheduler, "extractor_registry", None), "compatibility_overrides", None),
+                "ytdlp_version", "unavailable",
+            ),
+            getattr(
+                getattr(getattr(scheduler, "extractor_registry", None), "compatibility_overrides", None),
+                "enabled_count", 0,
+            ),
+        ),
     )
     await cast(Any, callback.message).edit_text(text, reply_markup=build_admin_keyboard(scheduler.paused))
 
@@ -1305,7 +1492,7 @@ async def admin_actions(
         return
     elif action == "resources":
         await cast(Any, callback.message).edit_text(
-            "⚙️ <b>Resource Mode</b>\n\nAuto Shared protects other services and remains the default.",
+            build_resource_text(governor.settings.resource_mode.value),
             reply_markup=build_resource_keyboard(governor.settings.resource_mode.value),
         )
         await callback.answer()
@@ -1318,9 +1505,9 @@ async def admin_actions(
         await cast(Any, callback.message).edit_text(
             "🧹 <b>Maintenance</b>\n\nChoose a confirmed maintenance operation.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Clean expired data", callback_data="ops:cleanup")],
-                [InlineKeyboardButton(text="Create private backup", callback_data="ops:backup")],
-                [InlineKeyboardButton(text="↩️ Back", callback_data="admin:status")],
+                [InlineKeyboardButton(text="🧹 Clean expired data", callback_data="ops:cleanup")],
+                [InlineKeyboardButton(text="💾 Create private backup", callback_data="ops:backup")],
+                [InlineKeyboardButton(text="↩️ Back to admin", callback_data="admin:status")],
             ]),
         )
         await callback.answer()
@@ -1338,7 +1525,9 @@ async def resource_mode(
         return
     mode = ResourceMode((callback.data or "").split(":", 1)[-1])
     await runtime_settings.set("resource_mode", mode.value, updated_by=callback.from_user.id)
-    await cast(Any, callback.message).edit_reply_markup(reply_markup=build_resource_keyboard(mode.value))
+    await cast(Any, callback.message).edit_text(
+        build_resource_text(mode.value), reply_markup=build_resource_keyboard(mode.value)
+    )
     await callback.answer("Resource mode saved")
 
 
@@ -1445,17 +1634,34 @@ async def home_actions(
         await _render_home(callback, db, governor)
     elif action == "new":
         await cast(Any, callback.message).edit_text(
-            f"📥 <b>New Download</b>\n\nSend one URL or up to "
-            f"{governor.settings.max_batch_urls} URLs in one message."
+            build_new_download_text(governor.settings.max_batch_urls),
+            reply_markup=build_new_download_keyboard(),
         )
     else:
+        user = await db.get_user(callback.from_user.id)
         await cast(Any, callback.message).edit_text(
-            "❓ <b>Help</b>\n\nSend public, non-DRM media links. Choose an exact source "
-            "format after analysis. Streams are never transcoded or silently substituted.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🏠 Home", callback_data="home:show")
-            ]]),
+            build_help_text("main"),
+            reply_markup=build_help_keyboard("main", is_admin=bool(user and user["is_admin"])),
         )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("help:"))
+async def help_section(callback: CallbackQuery, db: Database) -> None:
+    if not await _authorized(callback, db):
+        return
+    section = (callback.data or "").split(":", 1)[-1]
+    if section not in {"main", "quick", "quality", "batch", "queue", "settings", "failures", "privacy", "admin"}:
+        await callback.answer("Help topic unavailable.", show_alert=True)
+        return
+    user = await db.get_user(callback.from_user.id)
+    if section == "admin" and not (user and user["is_admin"]):
+        await callback.answer("Administrator access required.", show_alert=True)
+        return
+    await cast(Any, callback.message).edit_text(
+        build_help_text(section),
+        reply_markup=build_help_keyboard(section, is_admin=bool(user and user["is_admin"])),
+    )
     await callback.answer()
 
 
@@ -1495,8 +1701,10 @@ async def queue_cancel(
         job.job_id: position for job in jobs
         if (position := await db.queue_position(job.job_id)) is not None
     }
+    user = await db.get_user(callback.from_user.id)
     await cast(Any, callback.message).edit_text(
-        build_queue_text(jobs, positions), reply_markup=build_queue_keyboard(jobs)
+        build_queue_text(jobs, positions),
+        reply_markup=build_queue_keyboard(jobs, admin=bool(user and user["is_admin"])),
     )
     await callback.answer("Cancelled")
 

@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -33,7 +34,7 @@ async def test_async_app_initialization_and_graceful_shutdown(settings):
     assert app.scheduler._service_task is not None
     assert app.extractor_registry is app.scheduler.extractor_registry
     assert app.dp["extractor_registry"] is app.extractor_registry
-    await app._write_health()
+    await asyncio.gather(app._write_health(), app._write_health())
     assert is_healthy(settings)
     await app.shutdown()
     assert app.bot.session.closed

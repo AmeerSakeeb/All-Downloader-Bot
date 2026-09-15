@@ -13,7 +13,9 @@ from urllib.parse import urlsplit
 from core.config import Settings, get_settings
 from core.exceptions import (
     AuthenticationRequiredError, DRMProtectedError, ExtractionError,
-    ExtractionTimeoutError, SiteAccessChallengeError, UnsupportedUrlError,
+    ExtractionTimeoutError, ExtractorCompatibilityError, GeoRestrictedError,
+    MediaUnavailableError, NetworkFailureError, NoFormatsError,
+    SiteAccessChallengeError, UnsupportedUrlError,
 )
 from core.models import MediaAsset, MediaItem, MediaSession
 from downloads.process_supervisor import ProcessOutputLimitError, ProcessSupervisor
@@ -24,6 +26,8 @@ from security.ssrf import SSRFGuard
 from security.url_logging import sanitize_url_for_log
 from services.ytdlp_policy import CookieFileUnavailableError, YtDlpPolicy
 from services.cookie_profiles import CookieProfiles, CookieProfileError
+from services.compatibility import CompatibilityOverrideRegistry
+from services.site_policy import SitePolicyRegistry
 
 logger = logging.getLogger(__name__)
 METADATA_STDOUT_LIMIT_BYTES = 32 * 1024 * 1024
@@ -38,12 +42,16 @@ class YtDlpExtractor(Extractor):
         supervisor: ProcessSupervisor | None = None,
         proxy_url: str | None = None,
         profiles: CookieProfiles | None = None,
+        site_policies: SitePolicyRegistry | None = None,
+        compatibility_overrides: CompatibilityOverrideRegistry | None = None,
     ):
         self.settings = settings
         self.timeout_secs = timeout_secs
         self.supervisor = supervisor or ProcessSupervisor()
         self.proxy_url = proxy_url
         self.profiles = profiles
+        self.site_policies = site_policies or SitePolicyRegistry()
+        self.compatibility_overrides = compatibility_overrides or CompatibilityOverrideRegistry()
 
     async def can_extract(self, url: str) -> bool:
         return True
@@ -62,16 +70,17 @@ class YtDlpExtractor(Extractor):
             proxy_url = await temporary_proxy.start()
         try:
             process_owner = operation_id or f"extraction-{uuid.uuid4().hex}"
-            policy = YtDlpPolicy(settings, proxy_url, self.profiles)
+            transport_policy = YtDlpPolicy(settings, proxy_url, self.profiles)
+            site_policy = self.site_policies.resolve(url)
             impersonated = prefer_impersonation or (
-                settings.ytdlp_impersonation_fallback and self._is_tiktok_source(url)
+                settings.ytdlp_impersonation_fallback and site_policy.initial_impersonation
             )
             profile_name = cookie_profile
             for attempt_index in range(3):
                 attempt_type = self._attempt_type(bool(profile_name), impersonated)
                 try:
                     command = self._build_command(
-                        url, settings, policy, impersonated=impersonated,
+                        url, settings, transport_policy, impersonated=impersonated,
                         profile_name=profile_name,
                     )
                 except (CookieFileUnavailableError, CookieProfileError) as error:
@@ -97,7 +106,11 @@ class YtDlpExtractor(Extractor):
                         url, attempt_type, returncode=None, timed_out=True,
                         diagnostic="", category="extraction_timeout",
                     )
-                    if settings.ytdlp_impersonation_fallback and not impersonated:
+                    if (
+                        settings.ytdlp_impersonation_fallback
+                        and site_policy.retry_impersonation_on_challenge
+                        and not impersonated
+                    ):
                         impersonated = True
                         continue
                     raise ExtractionTimeoutError() from error
@@ -118,9 +131,13 @@ class YtDlpExtractor(Extractor):
                         self._log_attempt(
                             url, attempt_type, returncode=result.returncode,
                             timed_out=False, diagnostic="malformed metadata",
-                            category="extraction_failed",
+                            category="extractor_compatibility_failure",
                         )
-                        raise ExtractionError("yt-dlp returned malformed metadata") from error
+                        raise ExtractorCompatibilityError() from error
+                    metadata = self.compatibility_overrides.apply(
+                        site_policy.compatibility_override, metadata,
+                        site_policy_id=site_policy.policy_id,
+                    )
                     self._log_attempt(
                         url, attempt_type, returncode=0, timed_out=False,
                         diagnostic="", category="success",
@@ -132,6 +149,7 @@ class YtDlpExtractor(Extractor):
                     )
                 diagnostic = result.stderr.decode("utf-8", errors="replace")[-4000:]
                 category = self._classify_failure(diagnostic, original_url=url)
+                category = site_policy.expected_failure_mapping.get(category, category)
                 self._log_attempt(
                     url, attempt_type, returncode=result.returncode,
                     timed_out=False, diagnostic="<session diagnostic redacted>" if profile_name else self._safe_diagnostic(
@@ -139,7 +157,11 @@ class YtDlpExtractor(Extractor):
                     ), category=category,
                 )
                 if category == "authentication_required":
-                    profile = self.profiles.select(url) if self.profiles and not profile_name else None
+                    profile = (
+                        self.profiles.select(url)
+                        if site_policy.profile_allowed and self.profiles and not profile_name
+                        else None
+                    )
                     if profile:
                         profile_name = profile.name
                         continue
@@ -148,11 +170,27 @@ class YtDlpExtractor(Extractor):
                     raise UnsupportedUrlError(sanitize_url_for_log(url))
                 if category == "drm_unsupported":
                     raise DRMProtectedError(sanitize_url_for_log(url))
+                if category == "extractor_compatibility_failure":
+                    raise ExtractorCompatibilityError()
+                if category == "network_failure":
+                    raise NetworkFailureError()
+                if category == "geo_restricted":
+                    raise GeoRestrictedError()
+                if category == "media_unavailable":
+                    raise MediaUnavailableError(sanitize_url_for_log(url))
                 if category == "site_access_challenge":
-                    if settings.ytdlp_impersonation_fallback and not impersonated:
+                    if (
+                        settings.ytdlp_impersonation_fallback
+                        and site_policy.retry_impersonation_on_challenge
+                        and not impersonated
+                    ):
                         impersonated = True
                         continue
-                    profile = self.profiles.select(url) if self.profiles and not profile_name else None
+                    profile = (
+                        self.profiles.select(url)
+                        if site_policy.profile_allowed and self.profiles and not profile_name
+                        else None
+                    )
                     if profile:
                         profile_name = profile.name
                         continue
@@ -190,10 +228,22 @@ class YtDlpExtractor(Extractor):
         settings: Settings, *, impersonated: bool, profile_name: str | None = None,
     ) -> MediaSession:
         raw_formats = metadata.get("formats") or ([metadata] if metadata.get("url") else [])
-        formats = normalize_format_inventory(raw_formats, duration=metadata.get("duration"))
+        extractor_identity = str(
+            metadata.get("extractor_key") or metadata.get("extractor") or "yt-dlp"
+        )
+        formats = normalize_format_inventory(
+            raw_formats, duration=metadata.get("duration"),
+            extractor_identity=extractor_identity,
+        )
         items = self._media_items(metadata, parent_url=url)
         if not formats and not items:
-            raise ExtractionError("No downloadable formats were found")
+            raw_candidates = [item for item in raw_formats if isinstance(item, dict)]
+            if raw_candidates and all(
+                item.get("has_drm") is True or item.get("drm_family")
+                for item in raw_candidates
+            ):
+                raise DRMProtectedError(sanitize_url_for_log(url))
+            raise NoFormatsError()
         thumbnails = self._thumbnail_assets(metadata.get("thumbnails") or [])
         subtitles = self._subtitle_assets(metadata)
         playlist_count = int(metadata.get("playlist_count") or metadata.get("n_entries") or 0)
@@ -254,11 +304,34 @@ class YtDlpExtractor(Extractor):
         )):
             return "drm_unsupported"
         if any(value in lowered for value in (
+            "not available in your country", "not available in your region",
+            "geo restricted", "geo-restricted", "geographic restriction",
+        )):
+            return "geo_restricted"
+        if any(value in lowered for value in (
+            "video unavailable", "media unavailable", "has been removed",
+            "this video is private", "content is no longer available",
+        )):
+            return "media_unavailable"
+        if any(value in lowered for value in (
             "http error 403", "http error 429", "forbidden", "too many requests",
-            "impersonat", "tls", "ssl", "handshake", "certificate verify",
+            "impersonat",
             "access denied", "request blocked", "anti-bot", "captcha", "not a bot",
         )):
             return "site_access_challenge"
+        if any(value in lowered for value in (
+            "connection reset", "connection refused", "network is unreachable",
+            "temporary failure in name resolution", "name or service not known",
+            "remote end closed connection", "timed out", "timeout",
+            "tls", "ssl", "handshake", "certificate verify",
+        )):
+            return "network_failure"
+        if any(value in lowered for value in (
+            "unable to extract", "could not parse", "failed to parse", "parser error",
+            "signature extraction failed", "nsig extraction failed", "hash mismatch",
+            "expected key not found", "keyerror:", "attributeerror:",
+        )):
+            return "extractor_compatibility_failure"
         return "extraction_failed"
 
     @staticmethod
@@ -354,8 +427,13 @@ class YtDlpExtractor(Extractor):
         for position, entry in enumerate(metadata.get("entries") or [], 1):
             if not isinstance(entry, dict):
                 continue
-            raw_formats = entry.get("formats") or []
-            formats = normalize_format_inventory(raw_formats, duration=entry.get("duration"))
+            raw_formats = entry.get("formats") or ([entry] if entry.get("url") else [])
+            formats = normalize_format_inventory(
+                raw_formats, duration=entry.get("duration"),
+                extractor_identity=str(
+                    entry.get("extractor_key") or entry.get("extractor") or "yt-dlp"
+                ),
+            )
             webpage_url = entry.get("webpage_url")
             direct_source_url = entry.get("url") or entry.get("original_url")
             ext = str(entry.get("ext") or "").lower()

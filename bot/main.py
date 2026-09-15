@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -38,6 +39,9 @@ from jobqueue.scheduler import JobScheduler
 from resources.governor import ResourceGovernor
 from security.proxy import ControlledOutboundProxy
 from services.telegram_api import TelegramService
+from services.telegram_capabilities import TelegramCapabilities
+from services.compatibility import CompatibilityOverrideRegistry
+from services.site_policy import SitePolicyRegistry
 from services.cookie_profiles import CookieProfiles
 from services.maintenance import MaintenanceService
 from services.output_identity import build_completed_output_identity
@@ -65,6 +69,9 @@ class BotApplication:
         self.queue_mgr: Optional[QueueManager] = None
         self.scheduler: Optional[JobScheduler] = None
         self.telegram_service: Optional[TelegramService] = None
+        self.telegram_capabilities: Optional[TelegramCapabilities] = None
+        self.site_policies: Optional[SitePolicyRegistry] = None
+        self.compatibility_overrides: Optional[CompatibilityOverrideRegistry] = None
         self.supervisor: Optional[ProcessSupervisor] = None
         self.proxy: Optional[ControlledOutboundProxy] = None
         self.extractor_registry: Optional[ExtractorRegistry] = None
@@ -108,9 +115,13 @@ class BotApplication:
         )
         self.proxy = ControlledOutboundProxy()
         proxy_url = await self.proxy.start()
+        self.site_policies = SitePolicyRegistry()
+        self.compatibility_overrides = CompatibilityOverrideRegistry()
         self.extractor_registry = ExtractorRegistry(
             settings=self.settings, supervisor=self.supervisor, proxy=self.proxy,
             profiles=self.cookie_profiles,
+            site_policies=self.site_policies,
+            compatibility_overrides=self.compatibility_overrides,
         )
         self.governor = ResourceGovernor(self.db, self.file_mgr, self.settings)
         downloader = Downloader(
@@ -134,7 +145,11 @@ class BotApplication:
                 )
             )
         self.bot = self.bot_factory(token=self.settings.bot_token, **bot_kwargs)
-        self.telegram_service = TelegramService(self.bot, self.settings)
+        self.telegram_capabilities = TelegramCapabilities.from_settings(self.settings)
+        self.telegram_service = TelegramService(
+            self.bot, self.settings, capabilities=self.telegram_capabilities,
+        )
+        await self.telegram_service.refresh_capabilities()
 
         async def upload(path: Path, job: DownloadJob) -> bool:
             assert self.telegram_service is not None
@@ -233,6 +248,7 @@ class BotApplication:
         self.dp["queue_mgr"] = self.queue_mgr
         self.dp["scheduler"] = self.scheduler
         self.dp["telegram_service"] = self.telegram_service
+        self.dp["telegram_capabilities"] = self.telegram_capabilities
         self.dp["extractor_registry"] = self.extractor_registry
         self.dp["runtime_settings"] = self.runtime_settings
         access = AccessControlMiddleware(self.db, self.settings)
@@ -285,7 +301,7 @@ class BotApplication:
                         text=build_progress_text(job),
                         reply_markup=InlineKeyboardMarkup(
                             inline_keyboard=[[InlineKeyboardButton(
-                                text="❌ Cancel my delivery",
+                                text="❌ Cancel download",
                                 callback_data=f"cancel_sub:{recipient['subscriber_id']}",
                             )]]
                         ),
@@ -325,6 +341,8 @@ class BotApplication:
     async def _health_loop(self) -> None:
         while True:
             try:
+                if self.telegram_service:
+                    await self.telegram_service.refresh_capabilities()
                 await self._write_health()
             except Exception:
                 logger.exception("Health heartbeat failed")
@@ -345,10 +363,16 @@ class BotApplication:
             "maintenance_alive": bool(self._maintenance_task and not self._maintenance_task.done()),
             "maintenance_ok": bool(self.maintenance and self.maintenance.last_success and
                 time.time() - self.maintenance.last_success < self.settings.maintenance_interval_seconds + 120),
+            "telegram_transport": (
+                self.telegram_capabilities.mode if self.telegram_capabilities else "unknown"
+            ),
+            "telegram_endpoint_available": bool(
+                self.telegram_capabilities and self.telegram_capabilities.endpoint_available
+            ),
         })
         def write_atomic():
             self.health_file.parent.mkdir(parents=True, exist_ok=True)
-            pending = self.health_file.with_name(f"health_{os.getpid()}_{time.time_ns()}.tmp")
+            pending = self.health_file.with_name(f"health_{os.getpid()}_{uuid.uuid4().hex}.tmp")
             pending.write_text(payload, encoding="utf-8")
             try:
                 pending.replace(self.health_file)
@@ -363,13 +387,13 @@ class BotApplication:
         if not self.bot or not self.dp:
             raise RuntimeError("Application is not initialized")
         commands = [
-            BotCommand(command="start", description="Show access status"),
-            BotCommand(command="help", description="Show usage help"),
-            BotCommand(command="settings", description="Downloader preferences"),
-            BotCommand(command="queue", description="View active and waiting downloads"),
-            BotCommand(command="admin", description="Administration panel"),
-            BotCommand(command="allow", description="Authorize a user"),
-            BotCommand(command="disallow", description="Revoke a user"),
+            BotCommand(command="start", description="Open the downloader home screen"),
+            BotCommand(command="help", description="Open the Help Center"),
+            BotCommand(command="settings", description="Choose download preferences"),
+            BotCommand(command="queue", description="View and cancel your downloads"),
+            BotCommand(command="admin", description="Open the Admin Control Center"),
+            BotCommand(command="allow", description="Allow a user ID"),
+            BotCommand(command="disallow", description="Suspend a user ID"),
             BotCommand(command="listusers", description="List registered users"),
         ]
         await self.bot.set_my_commands(commands)

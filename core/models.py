@@ -123,6 +123,8 @@ class MediaFormat(BaseModel):
     """Represents a single media format exposed by an extractor."""
     format_id: str = Field(..., description="Exact extractor format ID")
     internal_key: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
+    extractor_identity: Optional[str] = None
+    format_description: Optional[str] = None
 
     # Stream types
     is_video: bool = True
@@ -135,6 +137,8 @@ class MediaFormat(BaseModel):
     vcodec_normalized: VideoCodec = VideoCodec.OTHER
     acodec_raw: Optional[str] = None
     acodec_normalized: AudioCodec = AudioCodec.OTHER
+    video_codec_profile: Optional[str] = None
+    audio_codec_profile: Optional[str] = None
 
     # Dimensions & Quality
     width: Optional[int] = None
@@ -148,6 +152,12 @@ class MediaFormat(BaseModel):
     # Container & Protocol
     ext: str = Field(default="mp4", description="File extension / container")
     protocol: Optional[str] = None
+    manifest_identity: Optional[str] = None
+    dynamic_range: Optional[str] = None
+    quality: Optional[float] = None
+    preference: Optional[float] = None
+    source_preference: Optional[float] = None
+    language_preference: Optional[float] = None
 
     # Audio metadata
     audio_language: Optional[str] = None
@@ -187,9 +197,13 @@ class MediaFormat(BaseModel):
         identity = {
             key: data.get(key)
             for key in (
-                "format_id", "vcodec_raw", "vcodec_normalized", "acodec_raw",
-                "acodec_normalized", "width", "height", "resolution_label", "fps",
-                "ext", "protocol", "is_video", "is_audio", "is_muxed",
+                "format_id", "extractor_identity", "format_description",
+                "vcodec_raw", "vcodec_normalized", "acodec_raw",
+                "acodec_normalized", "video_codec_profile", "audio_codec_profile",
+                "width", "height", "resolution_label", "fps", "vbr", "abr", "tbr",
+                "ext", "protocol", "manifest_identity", "dynamic_range", "quality",
+                "preference", "source_preference", "language_preference",
+                "is_video", "is_audio", "is_muxed",
                 "requires_separate_audio", "audio_language", "audio_is_default",
                 "audio_is_original", "filesize", "filesize_approx", "format_note",
                 "source_identity",

@@ -56,7 +56,7 @@ async def test_browse_all_formats_uses_scoped_draft(db, media_session):
     callback = Callback(1, f"all:{media_session.session_id}:0")
     await all_formats(callback, db)
 
-    assert "All Source Formats" in callback.message.edited_text
+    assert "All source qualities" in callback.message.edited_text
     assert callback.message.markup is not None
     draft = await db.get_ui_draft(1, f"format_filters:{media_session.session_id}")
     assert draft["session_id"] == media_session.session_id
@@ -145,19 +145,19 @@ async def test_admin_performance_renders_updates_and_resets(db, settings):
 
     callback = Callback(1, "admin:performance")
     await admin_actions(callback, db, governor, scheduler, service)
-    assert "Performance" in callback.message.edited_text
+    assert "Concurrency & limits" in callback.message.edited_text
 
     callback = Callback(1, "perf:down:+1")
     await performance_adjust(callback, db, governor, service)
     assert service.get("max_concurrent_downloads") == 3
-    assert "Performance" in callback.message.edited_text
+    assert "Concurrency & limits" in callback.message.edited_text
 
     callback = Callback(1, "perfreset:down")
     await performance_reset(callback, db, governor, service)
     assert service.get("max_concurrent_downloads") == service.bootstrap_value(
         "max_concurrent_downloads"
     )
-    assert "Performance" in callback.message.edited_text
+    assert "Concurrency & limits" in callback.message.edited_text
 
 
 @pytest.mark.asyncio
@@ -166,13 +166,13 @@ async def test_admin_advanced_performance_renders_and_updates(db, settings):
     await service.initialize()
     callback = Callback(1, "perfadvanced:show")
     await performance_advanced(callback, db, service)
-    assert "Advanced Performance" in callback.message.edited_text
+    assert "Advanced limits" in callback.message.edited_text
 
     before = int(service.get("max_queued_jobs_per_user"))
     callback = Callback(1, "perf:userq:+1")
     await performance_adjust(callback, db, PerformanceGovernor(), service)
     assert service.get("max_queued_jobs_per_user") == before + 1
-    assert "Advanced Performance" in callback.message.edited_text
+    assert "Advanced limits" in callback.message.edited_text
 
 
 @pytest.mark.asyncio
@@ -226,8 +226,8 @@ def test_progress_never_reports_download_percent_as_overall_completion():
     )
     text = build_progress_text(job)
     assert "Overall: 100" not in text
-    assert "merge pending" in text
-    assert "No resend required" in text
+    assert "safe finalizing slot" in text
+    assert "do not need to resend" in text
 
 
 @pytest.mark.asyncio
@@ -388,7 +388,7 @@ async def test_batch_download_ready_skips_nonready_items(
     text = callback.message.edited_text
     assert "Still analyzing" in text
     assert "Waiting for analysis" not in text
-    assert "Analysis failed" in text
+    assert "Needs attention" in text
     draft = await db.get_ui_draft(1, f"download-all:{parent.session_id}")
     assert draft is not None
     assert len(draft["choices"]) == 2

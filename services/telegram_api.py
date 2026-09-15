@@ -11,6 +11,7 @@ from aiogram.types import FSInputFile
 from core.config import SendMode, Settings, get_settings
 from core.exceptions import BotError, ErrorCategory
 from core.models import DownloadJob, MediaFormat, whole_duration_seconds
+from services.telegram_capabilities import TelegramCapabilities
 
 logger = logging.getLogger(__name__)
 
@@ -18,32 +19,44 @@ logger = logging.getLogger(__name__)
 class DeliverySizeError(BotError):
     error_category = ErrorCategory.DELIVERY_SIZE_EXCEEDED.value
 
+    def __init__(self, message: str, user_message: str | None = None):
+        super().__init__(message, user_message=user_message)
+        if "temporarily unavailable" in message.lower():
+            self.error_category = ErrorCategory.TELEGRAM_DELIVERY_UNAVAILABLE.value
+
 
 class TelegramService:
     """Delivers media files to Telegram users using streaming file references."""
 
-    def __init__(self, bot: Bot, settings: Optional[Settings] = None):
+    def __init__(
+        self,
+        bot: Bot,
+        settings: Optional[Settings] = None,
+        capabilities: TelegramCapabilities | None = None,
+    ):
         self.bot = bot
         self.settings = settings or get_settings()
+        self.capabilities = capabilities or TelegramCapabilities.from_settings(self.settings)
 
     @property
     def max_file_size_bytes(self) -> int:
         """Return maximum deliverable file size in bytes according to API transport mode."""
-        if self.settings.use_local_api:
-            return self.settings.local_api_max_file_size_mb * 1024 * 1024
-        return 50 * 1024 * 1024
+        return self.capabilities.max_upload_bytes
 
     def can_deliver_size(self, size_bytes: Optional[int]) -> tuple[bool, str]:
         """Preflight check whether a file size can be delivered via Telegram."""
-        if size_bytes is None:
-            return True, "Size unknown; delivery will be checked after download"
-        limit = self.max_file_size_bytes
-        if size_bytes > limit:
-            limit_mb = limit / (1024 * 1024)
-            size_mb = size_bytes / (1024 * 1024)
-            mode_str = "Local Bot API" if self.settings.use_local_api else "Standard Telegram Bot API"
-            return False, f"Estimated size ({size_mb:.1f} MB) exceeds {mode_str} limit ({limit_mb:.0f} MB)."
-        return True, "OK"
+        return self.capabilities.can_upload(size_bytes)
+
+    async def refresh_capabilities(self) -> bool:
+        """Verify readiness with a real Telegram method on the active transport."""
+
+        async def telegram_probe(_base_url: str) -> bool:
+            await self.bot.get_me()
+            return True
+
+        return await self.capabilities.refresh(
+            self.settings.local_api_base_url, telegram_probe,
+        )
 
     def can_deliver_selection(
         self, video: MediaFormat, audio: Optional[MediaFormat] = None

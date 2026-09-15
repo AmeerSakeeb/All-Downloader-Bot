@@ -101,6 +101,11 @@ async def test_selection_rejects_transport_and_queue_limits(
     callback = Callback(1, f"fmt:{too_large_session.session_id}:{oversized.internal_key}")
     await callback_format(callback, db, scheduler, settings, service)
     assert "exceeds" in callback.answers[-1][0]
+    assert "too large to send" in callback.message.edited_text
+    labels = [
+        button.text for row in callback.message.markup.inline_keyboard for button in row
+    ]
+    assert "🎞 Choose another quality" in labels and "↩️ Back" in labels
     assert await db.count_total_active_jobs() == 0
 
     await db.save_media_session(media_session)
@@ -114,7 +119,8 @@ async def test_selection_rejects_transport_and_queue_limits(
     await db.save_media_session(other_session)
     second = Callback(1, f"fmt:{other_session.session_id}:{other_format.internal_key}")
     await callback_format(second, db, scheduler, limited, service)
-    assert "maximum number" in second.answers[-1][0]
+    assert second.answers[-1][0] == "Preparing download…"
+    assert "maximum number" in second.message.edited_text
     assert await db.count_total_active_jobs() == 1
 
 

@@ -20,6 +20,8 @@ from storage.database import Database
 from services.favorites import FavoriteMatcher
 from ui.builders import (
     build_all_formats_keyboard, build_collection_keyboard, build_collection_text,
+    build_all_formats_text, build_analysis_error_keyboard,
+    build_error_text, build_new_download_keyboard,
     build_preferred_keyboard, build_preferred_media_text,
 )
 
@@ -167,10 +169,22 @@ async def handle_potential_url(
                 })
                 await db.delete_ui_draft(message.from_user.id, search_key)
                 await message.reply(
-                    f"🔎 <b>Format search:</b> {escape(filters['query'])}",
+                    build_all_formats_text(session, filters, 0),
                     reply_markup=build_all_formats_keyboard(session, filters, 0),
                 )
+            else:
+                await db.delete_ui_draft(message.from_user.id, search_key)
+                await message.reply(
+                    "⌛ <b>This format search expired</b>\n\nSend the media link again to start a new search.",
+                    reply_markup=build_new_download_keyboard(),
+                )
         return
+
+    pending_search = await db.get_latest_ui_draft(
+        message.from_user.id, "format_search:"
+    )
+    if pending_search:
+        await db.delete_ui_draft(message.from_user.id, pending_search[0])
 
     if scheduler.paused:
         await message.reply(
@@ -255,14 +269,17 @@ async def handle_potential_url(
     await db.save_media_session(pending)
 
     # Notify user extraction has begun
-    status_msg = await message.reply("🔍 <b>Analyzing link…</b>\n\nExtracting available formats.")
+    status_msg = await message.reply(
+        "🔎 <b>Analyzing link</b>\n\nChecking the original source qualities."
+    )
 
     try:
         lease, reason = await governor.acquire_stage("extraction")
         if not lease:
             await status_msg.edit_text(
-                "⏳ <b>Waiting for resources</b>\n\n"
-                "Your link is saved and analysis will start automatically.\nNo resend required."
+                "⏳ <b>Waiting for a safe analysis slot</b>\n\n"
+                "Your link is saved and analysis will start automatically.\n\n"
+                "You do not need to resend it."
             )
             lease = await _wait_for_extraction_lease(
                 governor, db, message.from_user.id
@@ -310,12 +327,17 @@ async def handle_potential_url(
     except ExtractionError as e:
         logger.error("Extraction failed for %s", sanitize_url_for_log(url), exc_info=True)
         await status_msg.edit_text(
-            f"❌ <b>Extraction failed</b>\n\nUnable to retrieve format information for this link.\n"
-            f"Reason: {escape(e.user_message)}"
+            build_error_text(getattr(e, "error_category", None)),
+            reply_markup=build_analysis_error_keyboard(),
         )
     except SecurityError as e:
         logger.warning("Security error during extraction for %s", sanitize_url_for_log(url))
-        await status_msg.edit_text(f"⚠️ <b>Security error</b>\n\n{e.user_message}")
+        await status_msg.edit_text(
+            "🔗 <b>This link cannot be used</b>\n\nThe address did not pass the bot's link safety checks.",
+            reply_markup=build_analysis_error_keyboard(),
+        )
     except Exception as e:
         logger.error(f"Unexpected error during URL analysis: {e}", exc_info=True)
-        await status_msg.edit_text("❌ <b>Unexpected error</b>\n\nCould not analyze this media link.")
+        await status_msg.edit_text(
+            build_error_text(None), reply_markup=build_analysis_error_keyboard()
+        )

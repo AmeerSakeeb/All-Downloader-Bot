@@ -197,8 +197,8 @@ async def test_cancel_batch_confirm_reaps_task_deletes_session_and_drafts(
 
     assert manager.active_count == 0
     assert await db.get_media_session(session.session_id) is None
-    assert callback.message.edited_text == "⏹ <b>Batch cancelled</b>"
-    assert callback.answers[-1][0] == "Batch cancelled."
+    assert "Batch analysis stopped" in callback.message.edited_text
+    assert callback.answers[-1][0] == "Batch analysis stopped"
     assert await db.get_ui_draft(1, f"cancel-confirm:{session.session_id}") is None
     assert await db.get_ui_draft(1, f"batch-view:{session.session_id}") is None
     assert await db.get_ui_draft(1, f"items:{session.session_id}") is None
@@ -234,17 +234,18 @@ async def test_batch_review_selection_checkmarks_and_nonready_lock(
     })
 
     initial = _build_review_keyboard(session, set())
-    assert f"☐ {ready.item_id[:6]}" in button_texts(initial)
-    assert f"🔒 {waiting.item_id[:6]}" in button_texts(initial)
+    assert "☐ 1 · Ready" in button_texts(initial)
+    assert "🔒 2 · Waiting" in button_texts(initial)
+    assert ready.item_id[:6] not in " ".join(button_texts(initial))
 
     callback = FakeCallback(f"itoggle:{session.session_id}:{ready.item_id}:0")
     await item_toggle(callback, db)
-    assert f"☑ {ready.item_id[:6]}" in button_texts(callback.message.markup)
+    assert "☑ 1 · Ready" in button_texts(callback.message.markup)
     assert f"iprocess:{session.session_id}" in callback_data(callback.message.markup)
 
     callback = FakeCallback(f"itoggle:{session.session_id}:{ready.item_id}:0")
     await item_toggle(callback, db)
-    assert f"☐ {ready.item_id[:6]}" in button_texts(callback.message.markup)
+    assert "☐ 1 · Ready" in button_texts(callback.message.markup)
 
     callback = FakeCallback(f"itoggle:{session.session_id}:{waiting.item_id}:0")
     await item_toggle(callback, db)

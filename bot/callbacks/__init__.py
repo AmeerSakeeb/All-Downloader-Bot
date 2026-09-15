@@ -10,13 +10,16 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from bot.batch_manager import global_batch_manager
 from core.config import Settings
 from core.models import JobStatus
-from extractors.format_manager import select_default_audio
+from extractors.format_manager import calculate_total_download_size, select_default_audio
 from jobqueue.manager import QueueManager
 from jobqueue.scheduler import JobScheduler
 from storage.database import Database, QueueLimitError
 from services.telegram_api import TelegramService
 from services.selection import submit_exact_selection
-from ui.builders import build_audio_keyboard, build_format_page_keyboard, build_progress_keyboard
+from ui.builders import (
+    build_audio_keyboard, build_audio_text, build_delivery_limit_keyboard,
+    build_delivery_limit_text, build_format_page_keyboard, build_progress_keyboard,
+)
 
 router = Router(name="phase1-callbacks")
 
@@ -91,7 +94,7 @@ async def callback_format(
     if selected.requires_separate_audio and not preferences.automatic_audio:
         if callback.message:
             await cast(Any, callback.message).edit_text(
-                "🎵 <b>Select an exact audio stream</b>\n\nNo audio conversion will occur.",
+                build_audio_text(session, selected.internal_key),
                 reply_markup=build_audio_keyboard(session, selected.internal_key),
             )
         await callback.answer()
@@ -102,12 +105,21 @@ async def callback_format(
         return
     allowed, reason = telegram_service.can_deliver_selection(selected, audio)
     if not allowed:
-        await callback.answer(reason, show_alert=True)
+        if callback.message:
+            total, exact = calculate_total_download_size(selected, audio)
+            await cast(Any, callback.message).edit_text(
+                build_delivery_limit_text(
+                    telegram_service.capabilities, total, estimated=not exact,
+                ),
+                reply_markup=build_delivery_limit_keyboard(session.session_id),
+            )
+        await callback.answer(reason)
         return
     if not callback.message:
         await callback.answer("The progress message is unavailable.", show_alert=True)
         return
     message = cast(Any, callback.message)
+    await callback.answer("Preparing download…")
     try:
         result = await submit_exact_selection(
             db=db,
@@ -129,34 +141,36 @@ async def callback_format(
                 [InlineKeyboardButton(text="🏠 Home", callback_data="home:show")],
             ]),
         )
-        await callback.answer(str(error), show_alert=True)
         return
     except ValueError:
-        await callback.answer("This menu is stale. Please resend the link.", show_alert=True)
+        await message.edit_text(
+            "⌛ <b>This selection is no longer available</b>\n\n"
+            "Send the link again to choose from the current source qualities.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📥 Send another link", callback_data="home:new")
+            ], [InlineKeyboardButton(text="🏠 Home", callback_data="home:show")]]),
+        )
         return
     if result.disposition == "cache":
         await message.edit_text("✅ <b>Delivered from private cache</b>\n\nThe exact selected output was reused.")
-        await callback.answer("Delivered")
     elif result.disposition == "coalesced":
         await message.edit_text(
             "🔗 <b>Joined an identical active download</b>\n\nYou will receive the exact output when ready.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-                text="❌ Cancel my delivery", callback_data=f"cancel_sub:{result.subscriber_id}"
+                text="❌ Cancel download", callback_data=f"cancel_sub:{result.subscriber_id}"
             )]]),
         )
-        await callback.answer("Joined active download")
     else:
         assert result.job is not None
         position = await db.queue_position(result.job.job_id)
         await message.edit_text(
-            "⏳ <b>Queued</b>\n\nYour download is saved and will start automatically.\n"
+            "⏳ <b>Download queued</b>\n\nYour download is saved and will start automatically.\n"
             + (f"Position: {position}\n" if position else "")
             + "No resend required.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-                text="❌ Cancel my delivery", callback_data=f"cancel_sub:{result.subscriber_id}"
+                text="❌ Cancel download", callback_data=f"cancel_sub:{result.subscriber_id}"
             )]]),
         )
-        await callback.answer("Download queued")
 
 
 @router.callback_query(F.data.startswith("cancel_session:"))
@@ -179,15 +193,15 @@ async def callback_cancel_session(callback: CallbackQuery, db: Database) -> None
                 {"confirmed": False},
             )
             await cast(Any, callback.message).edit_text(
-                "⏹ <b>Cancel this batch analysis?</b>\n\n"
-                "Active analysis stops. Ready items already queued are unaffected.",
+                "⏹ <b>Stop this batch analysis?</b>\n\n"
+                "Links still waiting or being analyzed will stop. Downloads already queued are unaffected.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(
-                        text="✅ Cancel Batch",
+                        text="⏹ Stop batch analysis",
                         callback_data=f"cancel_batch_confirm:{session.session_id}",
                     )],
                     [InlineKeyboardButton(
-                        text="↩️ Keep",
+                        text="↩️ Keep analyzing",
                         callback_data=f"cancel_keep:{session.session_id}",
                     )],
                 ]),
@@ -200,9 +214,12 @@ async def callback_cancel_session(callback: CallbackQuery, db: Database) -> None
         await db.delete_ui_draft(callback.from_user.id, f"batch-view:{session.session_id}")
         await db.delete_ui_draft(callback.from_user.id, f"items:{session.session_id}")
         await cast(Any, callback.message).edit_text(
-            "⏹ <b>Batch cancelled</b>",
+            "⏹ <b>Batch analysis stopped</b>\n\nLinks still waiting were not downloaded.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🏠 Home", callback_data="home:show")
+            ]]),
         )
-        await callback.answer("Batch cancelled.")
+        await callback.answer("Batch analysis stopped")
         return
     await db.delete_media_session(session.session_id, callback.from_user.id)
     if callback.message:
@@ -224,8 +241,13 @@ async def callback_cancel_batch_confirm(
     await db.delete_ui_draft(callback.from_user.id, f"batch-view:{session.session_id}")
     await db.delete_ui_draft(callback.from_user.id, f"items:{session.session_id}")
     if callback.message:
-        await cast(Any, callback.message).edit_text("⏹ <b>Batch cancelled</b>")
-    await callback.answer("Batch cancelled.")
+        await cast(Any, callback.message).edit_text(
+            "⏹ <b>Batch analysis stopped</b>\n\nLinks still waiting were not downloaded.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🏠 Home", callback_data="home:show")
+            ]]),
+        )
+    await callback.answer("Batch analysis stopped")
 
 
 @router.callback_query(F.data.startswith("cancel_keep:"))
