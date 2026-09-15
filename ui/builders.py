@@ -7,16 +7,18 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from core.models import (
-    DownloadJob, FavoriteFormatRule, JobStatus, MediaFormat, MediaSession, UserSettings,
+    DownloadJob, FavoriteFormatRule, JobStatus, MediaFormat, MediaItem, MediaSession,
+    UserSettings, whole_duration_seconds,
 )
 from services.favorites import FavoriteMatchResult
+from extractors.format_manager import calculate_total_download_size, select_default_audio
 
 
 def build_media_info_text(session: MediaSession) -> str:
     """Build a rich text description of the media session."""
-    duration_str = ""
-    if session.duration:
-        mins, secs = divmod(session.duration, 60)
+    display_seconds = whole_duration_seconds(session.duration)
+    if display_seconds is not None:
+        mins, secs = divmod(display_seconds, 60)
         hours, mins = divmod(mins, 60)
         if hours > 0:
             duration_str = f"🕒 Duration: {hours}:{mins:02d}:{secs:02d}"
@@ -315,11 +317,23 @@ def build_queue_keyboard(jobs: list[DownloadJob], *, admin: bool = False) -> Inl
     return builder.as_markup()
 
 
-def format_button_label(fmt: MediaFormat) -> str:
+def _size_display(size: int | None, exact: bool) -> str:
+    if size is None:
+        return "Unknown size"
+    mb = size / 1024**2
+    if mb >= 1024:
+        value = f"{mb / 1024:.2f} GB"
+    else:
+        value = f"{mb:.1f} MB"
+    return value if exact else f"~{value}"
+
+
+def format_button_label(fmt: MediaFormat, audio: MediaFormat | None = None) -> str:
     codec = fmt.vcodec_normalized.value.replace("H.265 / HEVC", "H265").replace("H.264 / AVC", "H264")
     quality = fmt.resolution_label or (f"{fmt.height}p" if fmt.height else "Unknown")
     fps = f"{fmt.fps:g}fps" if fmt.fps else "FPS ?"
-    return f"{codec} · {quality} {fps} · {fmt.format_size_display()}"
+    total, exact = calculate_total_download_size(fmt, audio)
+    return f"{codec} · {quality} {fps} · {_size_display(total, exact)}"
 
 
 def stream_status_text(fmt: MediaFormat) -> str:
@@ -335,7 +349,7 @@ def stream_status_text(fmt: MediaFormat) -> str:
 
 def build_preferred_media_text(
     session: MediaSession, result: FavoriteMatchResult, page: int = 0,
-    page_size: int = 6,
+    page_size: int = 6, *, automatic_audio: bool = True,
 ) -> str:
     pages = max(1, math.ceil(len(result.formats) / page_size))
     page = max(0, min(page, pages - 1))
@@ -352,7 +366,8 @@ def build_preferred_media_text(
     if not result.formats:
         lines.append("No enabled favorite rule has an exact match in this source.")
     for fmt in visible_formats:
-        lines.extend(("", f"⭐ <b>{escape(format_button_label(fmt))}</b>", stream_status_text(fmt)))
+        audio = select_default_audio(session.formats, fmt) if automatic_audio else None
+        lines.extend(("", f"⭐ <b>{escape(format_button_label(fmt, audio))}</b>", stream_status_text(fmt)))
     if result.total_combinations:
         available = result.total_combinations - result.unavailable_combinations
         lines.extend(("", f"{available} of {result.total_combinations} preferred combinations have an exact match."))
@@ -362,14 +377,15 @@ def build_preferred_media_text(
 
 def build_preferred_keyboard(
     session: MediaSession, result: FavoriteMatchResult, page: int = 0,
-    page_size: int = 6,
+    page_size: int = 6, *, automatic_audio: bool = True,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     pages = max(1, math.ceil(len(result.formats) / page_size))
     page = max(0, min(page, pages - 1))
     for fmt in result.formats[page * page_size:(page + 1) * page_size]:
+        audio = select_default_audio(session.formats, fmt) if automatic_audio else None
         builder.row(InlineKeyboardButton(
-            text=format_button_label(fmt), callback_data=f"detail:{session.session_id}:{fmt.internal_key}"
+            text=format_button_label(fmt, audio), callback_data=f"detail:{session.session_id}:{fmt.internal_key}"
         ))
     if pages > 1:
         nav = []
@@ -398,10 +414,11 @@ def build_preferred_keyboard(
     return builder.as_markup()
 
 
-def _duration(value: int | None) -> str:
-    if value is None:
+def _duration(value: float | None) -> str:
+    seconds_value = whole_duration_seconds(value)
+    if seconds_value is None:
         return "Unknown"
-    hours, remainder = divmod(value, 3600)
+    hours, remainder = divmod(seconds_value, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
 
@@ -416,7 +433,8 @@ def build_format_details_text(
             if manual_audio_required else ""
         )
         return (
-            f"🎞 <b>Selected Format</b>\n\n{escape(format_button_label(fmt))}\n"
+            f"🎞 <b>Selected Format</b>\n\n"
+            f"{escape(format_button_label(fmt, audio if not manual_audio_required else None))}\n"
             f"{stream_status_text(fmt)}{audio_note}\n\nNo compression or re-encoding will occur."
         )
     total = fmt.effective_size
@@ -424,7 +442,7 @@ def build_format_details_text(
     if audio:
         total = total + audio.effective_size if total is not None and audio.effective_size is not None else None
         exact = exact and audio.is_exact_size
-    total_text = "Unknown" if total is None else ("" if exact else "~") + f"{total / 1024**2:.1f} MB"
+    total_text = _size_display(total, exact)
     audio_text = "Manual audio selection required" if manual_audio_required else ("Already included" if fmt.is_muxed else (
         f"{audio.audio_language or 'Unknown language'} · {audio.acodec_normalized.value} · "
         f"{audio.abr:g} kbps" if audio and audio.abr else
@@ -433,7 +451,7 @@ def build_format_details_text(
     expected_text = "Depends on selected audio" if manual_audio_required else total_text
     audio_size_text = (
         "Choose an exact stream" if manual_audio_required else
-        (audio.format_size_display() if audio else ('Included' if fmt.is_muxed else 'Unknown'))
+        (audio.format_size_display() if audio else ('Included' if fmt.is_muxed else 'Unknown size'))
     )
     dimensions = f"{fmt.width}×{fmt.height}" if fmt.width and fmt.height else "Unknown dimensions"
     fps_text = f"{fmt.fps:g} FPS" if fmt.fps is not None else "Unknown FPS"
@@ -758,6 +776,27 @@ def build_assets_keyboard(session: MediaSession, kind: str) -> InlineKeyboardMar
     return builder.as_markup()
 
 
+def batch_item_status_text(item: MediaItem) -> str:
+    if item.analysis_status == "ready":
+        return "✅ Ready"
+    if item.analysis_status == "analyzing":
+        return "🔎 Analyzing"
+    if item.analysis_status == "waiting":
+        return "⏳ Waiting for analysis"
+    if item.analysis_status != "failed":
+        return "⏳ Waiting"
+    return {
+        "authentication_required": "🔐 Sign-in required",
+        "site_access_challenge": "🛡 Site access challenge",
+        "extraction_timeout": "⏳ Analysis timed out",
+        "unsupported_url": "❌ Unsupported link",
+        "media_unavailable": "❌ Media unavailable",
+        "access_revoked": "⛔ Access revoked",
+        "extraction_failed": "❌ Analysis error",
+        "unexpected_error": "❌ Analysis error",
+    }.get(item.analysis_error_category, "❌ Failed")
+
+
 def build_collection_text(session: MediaSession) -> str:
     title = (
         "🔗 <b>Batch URLs</b>" if session.session_kind == "batch" else
@@ -765,13 +804,9 @@ def build_collection_text(session: MediaSession) -> str:
         "📚 <b>Playlist Detected</b>"
     )
     if session.session_kind == "batch":
-        status_icons = {
-            "ready": "✅ Ready", "analyzing": "🔎 Analyzing",
-            "waiting": "⏳ Waiting for analysis", "failed": "❌ Failed",
-        }
         lines = ["📥 <b>Batch received</b>", "", f"{len(session.items)} links", ""]
         for index, item in enumerate(session.items, 1):
-            state = status_icons.get(item.analysis_status, "⏳ Waiting")
+            state = batch_item_status_text(item)
             lines.extend((f"{index}. {escape(item.title)}", f"   {state}"))
         return "\n".join(lines)
     lines = [title, "", f"<b>Title:</b> {escape(session.title)}", f"Items loaded: {len(session.items)}"]

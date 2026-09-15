@@ -2,11 +2,25 @@
 
 import hashlib
 import json
+import math
 import time
 import uuid
 from enum import Enum
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, field_validator
+
+
+def whole_duration_seconds(value: Optional[float]) -> Optional[int]:
+    """Convert precise source duration only at an integer API/UI boundary."""
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return int(round(seconds))
 
 
 class VideoCodec(str, Enum):
@@ -100,6 +114,7 @@ class MediaItem(BaseModel):
     max_height: Optional[int] = None
     formats: List["MediaFormat"] = Field(default_factory=list)
     thumbnail_url: Optional[str] = None
+    duration: Optional[float] = None
     analysis_status: str = "ready"
     analysis_error_category: Optional[str] = None
 
@@ -195,7 +210,7 @@ class MediaSession(BaseModel):
     extractor: str = "yt-dlp"
 
     title: str = "Unknown Title"
-    duration: Optional[int] = None  # seconds
+    duration: Optional[float] = None  # precise source seconds
     uploader: Optional[str] = None
     thumbnail_url: Optional[str] = None
     description: Optional[str] = None
@@ -301,3 +316,5 @@ class DownloadJob(BaseModel):
     ytdlp_impersonated: bool = False
     cookie_profile: Optional[str] = None
     source_media_id: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    source_duration: Optional[float] = None

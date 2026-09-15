@@ -63,7 +63,9 @@ class YtDlpExtractor(Extractor):
         try:
             process_owner = operation_id or f"extraction-{uuid.uuid4().hex}"
             policy = YtDlpPolicy(settings, proxy_url, self.profiles)
-            impersonated = prefer_impersonation
+            impersonated = prefer_impersonation or (
+                settings.ytdlp_impersonation_fallback and self._is_tiktok_source(url)
+            )
             profile_name = cookie_profile
             for attempt_index in range(3):
                 attempt_type = self._attempt_type(bool(profile_name), impersonated)
@@ -129,7 +131,7 @@ class YtDlpExtractor(Extractor):
                         impersonated=impersonated, profile_name=profile_name,
                     )
                 diagnostic = result.stderr.decode("utf-8", errors="replace")[-4000:]
-                category = self._classify_failure(diagnostic)
+                category = self._classify_failure(diagnostic, original_url=url)
                 self._log_attempt(
                     url, attempt_type, returncode=result.returncode,
                     timed_out=False, diagnostic="<session diagnostic redacted>" if profile_name else self._safe_diagnostic(
@@ -149,6 +151,10 @@ class YtDlpExtractor(Extractor):
                 if category == "site_access_challenge":
                     if settings.ytdlp_impersonation_fallback and not impersonated:
                         impersonated = True
+                        continue
+                    profile = self.profiles.select(url) if self.profiles and not profile_name else None
+                    if profile:
+                        profile_name = profile.name
                         continue
                     raise SiteAccessChallengeError()
                 raise ExtractionError(
@@ -184,7 +190,7 @@ class YtDlpExtractor(Extractor):
         settings: Settings, *, impersonated: bool, profile_name: str | None = None,
     ) -> MediaSession:
         raw_formats = metadata.get("formats") or ([metadata] if metadata.get("url") else [])
-        formats = normalize_format_inventory(raw_formats)
+        formats = normalize_format_inventory(raw_formats, duration=metadata.get("duration"))
         items = self._media_items(metadata, parent_url=url)
         if not formats and not items:
             raise ExtractionError("No downloadable formats were found")
@@ -228,13 +234,18 @@ class YtDlpExtractor(Extractor):
         return "impersonated" if impersonated else "normal"
 
     @staticmethod
-    def _classify_failure(diagnostic: str) -> str:
+    def _classify_failure(diagnostic: str, original_url: str | None = None) -> str:
         lowered = diagnostic.lower()
         if any(value in lowered for value in (
             "sign in to confirm", "login required", "log in to", "cookies-from-browser",
             "use --cookies", "authentication required",
         )):
             return "authentication_required"
+        if (
+            "unsupported url" in lowered
+            and YtDlpExtractor._is_tiktok_about_challenge(original_url, diagnostic)
+        ):
+            return "site_access_challenge"
         if "unsupported url" in lowered or "no suitable extractor" in lowered:
             return "unsupported_url"
         if any(value in lowered for value in (
@@ -249,6 +260,32 @@ class YtDlpExtractor(Extractor):
         )):
             return "site_access_challenge"
         return "extraction_failed"
+
+    @staticmethod
+    def _is_tiktok_source(url: str | None) -> bool:
+        if not url:
+            return False
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+        return host in {"tiktok.com", "www.tiktok.com", "vt.tiktok.com", "vm.tiktok.com"}
+
+    @classmethod
+    def _is_tiktok_about_challenge(cls, original_url: str | None, diagnostic: str) -> bool:
+        if not cls._is_tiktok_source(original_url):
+            return False
+        for value in re.findall(r"https?://[^\s<>]+", diagnostic, flags=re.IGNORECASE):
+            try:
+                parsed = urlsplit(value.rstrip(".,;:!?)]}'\""))
+            except ValueError:
+                continue
+            host = (parsed.hostname or "").lower().rstrip(".")
+            segments = [segment for segment in parsed.path.lower().split("/") if segment]
+            if (
+                host in {"tiktok.com", "www.tiktok.com"}
+                and len(segments) in {1, 2}
+                and segments[-1:] == ["about"]
+            ):
+                return True
+        return False
 
     @staticmethod
     def _safe_diagnostic(value: str, cookie_file) -> str:
@@ -318,7 +355,7 @@ class YtDlpExtractor(Extractor):
             if not isinstance(entry, dict):
                 continue
             raw_formats = entry.get("formats") or []
-            formats = normalize_format_inventory(raw_formats)
+            formats = normalize_format_inventory(raw_formats, duration=entry.get("duration"))
             webpage_url = entry.get("webpage_url")
             direct_source_url = entry.get("url") or entry.get("original_url")
             ext = str(entry.get("ext") or "").lower()
@@ -351,6 +388,7 @@ class YtDlpExtractor(Extractor):
                 max_height=max(heights) if heights else None,
                 formats=formats,
                 thumbnail_url=entry.get("thumbnail"),
+                duration=entry.get("duration"),
             ))
         return items
 

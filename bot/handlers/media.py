@@ -120,6 +120,7 @@ async def _analyze_batch(
             item.title = child.title or item.title
             item.formats = child.formats
             item.thumbnail_url = child.thumbnail_url
+            item.duration = child.duration
             item.extractor_id = child.media_id
             item.source_extractor = child.extractor
             item.analysis_status = "ready"
@@ -293,8 +294,12 @@ async def handle_potential_url(
             preferences = await db.get_user_settings(message.from_user.id)
             rules = await db.ensure_default_favorite_rules(message.from_user.id)
             matches = FavoriteMatcher.match(session.formats, rules, preferences.matching_strategy)
-            response_text = build_preferred_media_text(session, matches)
-            reply_markup = build_preferred_keyboard(session, matches)
+            response_text = build_preferred_media_text(
+                session, matches, automatic_audio=preferences.automatic_audio,
+            )
+            reply_markup = build_preferred_keyboard(
+                session, matches, automatic_audio=preferences.automatic_audio,
+            )
 
         await status_msg.edit_text(
             text=response_text,

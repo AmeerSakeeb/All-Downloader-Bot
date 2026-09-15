@@ -41,7 +41,7 @@ from ui.builders import (
     build_performance_advanced_text, build_queue_keyboard, build_queue_text,
     build_rule_editor, build_settings_keyboard, build_settings_section_keyboard,
     build_settings_text, build_users_keyboard,
-    build_user_details, format_button_label,
+    build_user_details, batch_item_status_text, format_button_label,
 )
 
 router = Router(name="phase2-callbacks")
@@ -78,8 +78,12 @@ async def _preferred(session: MediaSession, db: Database, page: int = 0):
     rules = await db.ensure_default_favorite_rules(session.user_id)
     result = FavoriteMatcher.match(session.formats, rules, preferences.matching_strategy)
     return (
-        build_preferred_media_text(session, result, page),
-        build_preferred_keyboard(session, result, page),
+        build_preferred_media_text(
+            session, result, page, automatic_audio=preferences.automatic_audio,
+        ),
+        build_preferred_keyboard(
+            session, result, page, automatic_audio=preferences.automatic_audio,
+        ),
     )
 
 
@@ -669,7 +673,7 @@ async def _extract_child_session(
             user_id=user_id, url=item.source_url, canonical_url=item.source_url,
             extractor=item.source_extractor or parent.extractor, title=item.title,
             media_id=item.extractor_id,
-            thumbnail_url=item.thumbnail_url, formats=item.formats,
+            thumbnail_url=item.thumbnail_url, duration=item.duration, formats=item.formats,
             parent_collection_url=item.parent_collection_url if uses_parent else None,
             collection_entry_index=item.collection_entry_index if uses_parent else None,
             collection_entry_id=item.collection_entry_id if uses_parent else None,
@@ -717,6 +721,7 @@ def _batch_ready_child(parent: MediaSession, item: MediaItem, user_id: int) -> M
         user_id=user_id, url=item.source_url, canonical_url=item.source_url,
         extractor=item.source_extractor or parent.extractor, title=item.title,
         media_id=item.extractor_id, thumbnail_url=item.thumbnail_url,
+        duration=item.duration,
         formats=item.formats,
         parent_collection_url=item.parent_collection_url or None,
         collection_entry_index=item.collection_entry_index or None,
@@ -1010,20 +1015,11 @@ async def collection_item(
     await callback.answer()
 
 
-_STATUS_ICONS = {
-    "ready": "✅",
-    "analyzing": "🔎",
-    "waiting": "⏳",
-    "failed": "❌",
-}
-
-
 def _build_review_text(session: MediaSession) -> str:
     lines = []
     for index, item in enumerate(session.items, 1):
-        icon = _STATUS_ICONS.get(item.analysis_status, "⏳")
-        state = item.analysis_status.replace("_", " ").title()
-        lines.append(f"{icon} {index}. {escape(item.title)} ({state})")
+        state = batch_item_status_text(item)
+        lines.append(f"{index}. {escape(item.title)} — {state}")
     return "\n".join(lines)
 
 

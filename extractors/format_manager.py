@@ -1,6 +1,7 @@
 """Format inventory normalization, companion audio selection, and size calculation."""
 
 import logging
+import math
 from typing import Any, Dict, List, Optional, Tuple
 from core.models import AudioCodec, MediaFormat, VideoCodec
 from extractors.codec_normalizer import normalize_audio_codec, normalize_video_codec
@@ -35,7 +36,41 @@ def parse_resolution_label(height: Optional[int], width: Optional[int]) -> Optio
     return None
 
 
-def normalize_format_inventory(raw_formats: List[Dict[str, Any]]) -> List[MediaFormat]:
+def _positive_number(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _estimated_size_bytes(
+    raw: Dict[str, Any], *, is_video: bool, is_audio: bool,
+    duration: Any = None,
+) -> Optional[int]:
+    """Estimate stream bytes without changing exact-size semantics."""
+    seconds = _positive_number(raw.get("duration")) or _positive_number(duration)
+    if seconds is None:
+        return None
+
+    tbr = _positive_number(raw.get("tbr"))
+    vbr = _positive_number(raw.get("vbr"))
+    abr = _positive_number(raw.get("abr"))
+    bitrate_kbps: Optional[float]
+    if is_video and is_audio:
+        bitrate_kbps = tbr or ((vbr + abr) if vbr is not None and abr is not None else None)
+    elif is_video:
+        bitrate_kbps = tbr or vbr
+    else:
+        bitrate_kbps = abr or tbr
+    if bitrate_kbps is None:
+        return None
+    return max(1, int(round(seconds * bitrate_kbps * 1000 / 8)))
+
+
+def normalize_format_inventory(
+    raw_formats: List[Dict[str, Any]], *, duration: Any = None,
+) -> List[MediaFormat]:
     """
     Additive normalization of all extractor-provided formats.
     Preserves EVERY genuine downloadable format without discarding.
@@ -75,6 +110,10 @@ def normalize_format_inventory(raw_formats: List[Dict[str, Any]]) -> List[MediaF
 
         filesize = raw.get("filesize")
         filesize_approx = raw.get("filesize_approx")
+        if filesize is None and filesize_approx is None:
+            filesize_approx = _estimated_size_bytes(
+                raw, is_video=is_video, is_audio=is_audio, duration=duration,
+            )
         audio_lang = raw.get("language") or raw.get("audio_language")
         format_note = raw.get("format_note") or ""
 

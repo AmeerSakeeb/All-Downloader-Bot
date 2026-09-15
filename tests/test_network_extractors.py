@@ -8,6 +8,8 @@ from core.exceptions import (
     AuthenticationRequiredError,
     ExtractionError,
     ExtractionTimeoutError,
+    SiteAccessChallengeError,
+    UnsupportedUrlError,
 )
 from core.models import AudioCodec, MediaItem, VideoCodec
 from downloads.process_supervisor import ProcessOutputLimitError, ProcessResult
@@ -188,6 +190,146 @@ async def test_ytdlp_does_not_retry_authentication_failure(monkeypatch, settings
     with pytest.raises(AuthenticationRequiredError):
         await extractor.extract("https://example.com/private", 1)
     assert supervisor.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_facebook_fractional_duration_builds_session(monkeypatch, settings):
+    class Supervisor:
+        async def run(self, command, **kwargs):
+            payload = {
+                "duration": 33.505,
+                "formats": [{
+                    "format_id": "v", "vcodec": "h264", "acodec": "aac",
+                    "tbr": 1000,
+                }],
+            }
+            return ProcessResult(0, json.dumps(payload).encode(), b"")
+
+    monkeypatch.setattr("extractors.ytdlp_extractor.SSRFGuard.validate_url", lambda url: [])
+    extractor = YtDlpExtractor(settings=settings, supervisor=Supervisor(), proxy_url="http://proxy")
+    session = await extractor.extract("https://www.facebook.com/watch?v=1", 1)
+    assert session.duration == 33.505
+    assert session.formats[0].filesize is None
+    assert session.formats[0].filesize_approx is not None
+
+
+@pytest.mark.asyncio
+async def test_tiktok_short_about_redirect_is_access_challenge_with_impersonation(
+    monkeypatch, settings,
+):
+    class Supervisor:
+        def __init__(self):
+            self.commands = []
+
+        async def run(self, command, **kwargs):
+            self.commands.append(command)
+            return ProcessResult(
+                1, b"", b"ERROR: Unsupported URL: https://www.tiktok.com/in/about",
+            )
+
+    supervisor = Supervisor()
+    monkeypatch.setattr("extractors.ytdlp_extractor.SSRFGuard.validate_url", lambda url: [])
+    extractor = YtDlpExtractor(settings=settings, supervisor=supervisor, proxy_url="http://proxy")
+    with pytest.raises(SiteAccessChallengeError):
+        await extractor.extract("https://vt.tiktok.com/short", 1)
+    assert len(supervisor.commands) == 1
+    assert "--impersonate" in supervisor.commands[0]
+
+
+def test_vm_tiktok_is_an_exact_supported_short_link_host():
+    assert YtDlpExtractor._is_tiktok_source("https://vm.tiktok.com/short")
+    assert not YtDlpExtractor._is_tiktok_source("https://arbitrary.tiktok.com/short")
+
+
+@pytest.mark.asyncio
+async def test_true_unsupported_url_does_not_get_challenge_retry(monkeypatch, settings):
+    class Supervisor:
+        calls = 0
+
+        async def run(self, command, **kwargs):
+            self.calls += 1
+            return ProcessResult(1, b"", b"ERROR: Unsupported URL: https://example.com/nope")
+
+    supervisor = Supervisor()
+    monkeypatch.setattr("extractors.ytdlp_extractor.SSRFGuard.validate_url", lambda url: [])
+    extractor = YtDlpExtractor(settings=settings, supervisor=supervisor, proxy_url="http://proxy")
+    with pytest.raises(UnsupportedUrlError):
+        await extractor.extract("https://example.com/nope", 1)
+    assert supervisor.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_access_challenge_uses_matching_profile_after_impersonation(monkeypatch, settings):
+    class Profile:
+        name = "authorized"
+
+    class Profiles:
+        def select(self, url, name=None):
+            assert url == "https://example.com/video"
+            return Profile()
+
+    class Supervisor:
+        def __init__(self):
+            self.commands = []
+
+        async def run(self, command, **kwargs):
+            self.commands.append(command)
+            if len(self.commands) < 3:
+                return ProcessResult(1, b"", b"HTTP Error 403: Forbidden")
+            payload = {"formats": [{"format_id": "v", "vcodec": "h264", "acodec": "aac"}]}
+            return ProcessResult(0, json.dumps(payload).encode(), b"")
+
+    def command(url, settings, policy, *, impersonated, profile_name=None):
+        return ["yt-dlp", "impersonated" if impersonated else "public", profile_name or "no-profile"]
+
+    supervisor = Supervisor()
+    monkeypatch.setattr("extractors.ytdlp_extractor.SSRFGuard.validate_url", lambda url: [])
+    monkeypatch.setattr(YtDlpExtractor, "_build_command", staticmethod(command))
+    extractor = YtDlpExtractor(
+        settings=settings, supervisor=supervisor, proxy_url="http://proxy", profiles=Profiles(),
+    )
+    session = await extractor.extract("https://example.com/video", 1)
+    assert supervisor.commands == [
+        ["yt-dlp", "public", "no-profile"],
+        ["yt-dlp", "impersonated", "no-profile"],
+        ["yt-dlp", "impersonated", "authorized"],
+    ]
+    assert session.cookie_profile == "authorized"
+
+
+@pytest.mark.asyncio
+async def test_youtube_authentication_uses_matching_profile_when_available(monkeypatch, settings):
+    class Profile:
+        name = "youtube"
+
+    class Profiles:
+        def select(self, url, name=None):
+            assert "youtube.com" in url
+            return Profile()
+
+    class Supervisor:
+        def __init__(self):
+            self.commands = []
+
+        async def run(self, command, **kwargs):
+            self.commands.append(command)
+            if len(self.commands) == 1:
+                return ProcessResult(1, b"", b"Sign in to confirm you're not a bot. Use --cookies")
+            payload = {"formats": [{"format_id": "v", "vcodec": "h264", "acodec": "aac"}]}
+            return ProcessResult(0, json.dumps(payload).encode(), b"")
+
+    def command(url, settings, policy, *, impersonated, profile_name=None):
+        return ["yt-dlp", profile_name or "no-profile"]
+
+    supervisor = Supervisor()
+    monkeypatch.setattr("extractors.ytdlp_extractor.SSRFGuard.validate_url", lambda url: [])
+    monkeypatch.setattr(YtDlpExtractor, "_build_command", staticmethod(command))
+    extractor = YtDlpExtractor(
+        settings=settings, supervisor=supervisor, proxy_url="http://proxy", profiles=Profiles(),
+    )
+    session = await extractor.extract("https://www.youtube.com/watch?v=1", 1)
+    assert supervisor.commands == [["yt-dlp", "no-profile"], ["yt-dlp", "youtube"]]
+    assert session.cookie_profile == "youtube"
 
 
 @pytest.mark.asyncio

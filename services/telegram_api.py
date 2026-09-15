@@ -3,12 +3,14 @@
 import logging
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile
 
 from core.config import SendMode, Settings, get_settings
 from core.exceptions import BotError, ErrorCategory
-from core.models import DownloadJob, MediaFormat
+from core.models import DownloadJob, MediaFormat, whole_duration_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -77,30 +79,56 @@ class TelegramService:
         if not allowed:
             raise DeliverySizeError(reason, user_message=reason)
 
-        input_file = FSInputFile(str(file_path), filename=file_path.name)
         mode = job.send_mode or self.settings.default_send_mode.value
 
         logger.info(f"Sending file {file_path.name} to chat {job.chat_id} (Mode: {mode})")
 
         if mode == SendMode.VIDEO.value or mode == "video":
+            snapshot = job.video_format_snapshot or {}
+            video_metadata = {
+                "supports_streaming": True,
+                **self._positive_dimension("width", snapshot.get("width")),
+                **self._positive_dimension("height", snapshot.get("height")),
+            }
+            duration = whole_duration_seconds(job.source_duration)
+            if duration is not None:
+                video_metadata["duration"] = duration
+            cover = self._safe_cover_url(job.thumbnail_url)
+            if cover:
+                video_metadata["cover"] = cover
             try:
                 msg = await self.bot.send_video(
                     chat_id=job.chat_id,
-                    video=input_file,
+                    video=FSInputFile(str(file_path), filename=file_path.name),
                     caption=caption,
-                    supports_streaming=True
+                    **video_metadata,
                 )
                 if msg.video:
                     job.telegram_file_id = msg.video.file_id
                 return
-            except Exception as e:
-                logger.warning(f"Failed sending as video, falling back to document: {e}")
-                # Fallback to sending as document/file if Telegram video delivery fails
+            except TelegramBadRequest as error:
+                if cover and self._is_cover_bad_request(error):
+                    logger.info("Telegram rejected video delivery metadata; retrying without source cover")
+                    video_metadata.pop("cover", None)
+                    try:
+                        msg = await self.bot.send_video(
+                            chat_id=job.chat_id,
+                            video=FSInputFile(str(file_path), filename=file_path.name),
+                            caption=caption,
+                            **video_metadata,
+                        )
+                        if msg.video:
+                            job.telegram_file_id = msg.video.file_id
+                        return
+                    except TelegramBadRequest:
+                        pass
+                logger.warning("Telegram video delivery failed; falling back to document")
+                # Preserve the existing safe document fallback for unusual codecs.
 
         # Send as document / file
         msg = await self.bot.send_document(
             chat_id=job.chat_id,
-            document=input_file,
+            document=FSInputFile(str(file_path), filename=file_path.name),
             caption=caption
         )
         if msg.document:
@@ -119,3 +147,44 @@ class TelegramService:
             except Exception:
                 logger.info("Cached file is not deliverable as video; trying document")
         await self.bot.send_document(chat_id=chat_id, document=file_id, caption=caption)
+
+    @staticmethod
+    def _positive_dimension(name: str, value) -> dict[str, int]:
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return {name: value}
+        return {}
+
+    @staticmethod
+    def _safe_cover_url(value: str | None) -> str | None:
+        if not value:
+            return None
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return None
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return None
+        return value
+
+    @staticmethod
+    def _is_cover_bad_request(error: TelegramBadRequest) -> bool:
+        """Recognize only API rejections plausibly caused by a remote cover."""
+        message = str(getattr(error, "message", "") or "").lower()
+        if any(phrase in message for phrase in (
+            "failed to get http url content",
+            "failed to fetch http url content",
+            "wrong http url specified",
+            "wrong file identifier/http url specified",
+        )):
+            return True
+        if not any(subject in message for subject in ("cover", "thumbnail")):
+            return False
+        return any(reason in message for reason in (
+            "invalid", "wrong", "rejected", "failed", "unavailable", "expired",
+            "unsupported", "unacceptable", "not found", "cannot", "can't",
+        ))

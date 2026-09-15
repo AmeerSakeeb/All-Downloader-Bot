@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from core.models import JobStatus
+from core.models import JobStatus, MediaSession
 from storage.database import CURRENT_SCHEMA_VERSION, Database
 
 
@@ -59,12 +59,55 @@ async def test_session_round_trip(db, media_session):
     assert loaded and loaded.formats[0].format_id == "137/unsafe-id"
 
 
+@pytest.mark.asyncio
+async def test_fractional_session_duration_round_trip_uses_real_affinity(db):
+    session = MediaSession(
+        user_id=1, url="https://example.com/facebook", duration=33.505,
+    )
+    await db.save_media_session(session)
+    loaded = await db.get_media_session(session.session_id)
+    columns = await (await db.connection.execute("PRAGMA table_info(media_sessions)")).fetchall()
+    duration_column = next(row for row in columns if row["name"] == "duration")
+    assert loaded and loaded.duration == 33.505
+    assert duration_column["type"].upper() == "REAL"
+
+
+@pytest.mark.asyncio
+async def test_duration_migration_preserves_existing_session_rows(tmp_path):
+    path = tmp_path / "duration-v10.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at REAL NOT NULL);
+            INSERT INTO schema_migrations VALUES(10, 1);
+            CREATE TABLE media_sessions(
+              session_id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,url TEXT NOT NULL,
+              canonical_url TEXT,extractor TEXT NOT NULL,title TEXT,duration INTEGER,
+              uploader TEXT,thumbnail_url TEXT,formats_json TEXT NOT NULL,
+              created_at REAL NOT NULL,expires_at REAL NOT NULL,
+              extras_json TEXT NOT NULL DEFAULT '{}');
+            INSERT INTO media_sessions VALUES(
+              'legacy',1,'https://example.com/v',NULL,'test','Legacy',33.505,
+              NULL,NULL,'[]',1,99999999999,'{}');
+            """
+        )
+    database = Database(path)
+    await database.connect()
+    loaded = await database.get_media_session("legacy")
+    columns = await (await database.connection.execute("PRAGMA table_info(media_sessions)")).fetchall()
+    assert loaded and loaded.duration == 33.505
+    assert next(row for row in columns if row["name"] == "duration")["type"] == "REAL"
+    await database.close()
+
+
 def test_session_ttl_uses_config(media_session, settings):
     assert media_session.expires_at - media_session.created_at == settings.media_session_ttl
 
 
 @pytest.mark.asyncio
 async def test_job_creation_snapshots_execution(db, media_session, video_format, audio_format):
+    media_session.thumbnail_url = "https://cdn.example.com/cover.jpg?signature=secret"
+    media_session.duration = 33.505
     await db.save_media_session(media_session)
     job = await db.create_download_job(
         session=media_session, video_format=video_format, audio_format=audio_format, chat_id=99
@@ -73,6 +116,8 @@ async def test_job_creation_snapshots_execution(db, media_session, video_format,
     assert loaded.video_format_snapshot["format_id"] == "137/unsafe-id"
     assert loaded.audio_format_snapshot["format_id"] == "140"
     assert loaded.source_url == media_session.url
+    assert loaded.thumbnail_url == media_session.thumbnail_url
+    assert loaded.source_duration == 33.505
 
 
 @pytest.mark.asyncio

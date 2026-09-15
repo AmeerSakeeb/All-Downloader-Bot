@@ -16,7 +16,7 @@ from core.models import (
     MediaFormat, MediaSession, UserSettings,
 )
 
-CURRENT_SCHEMA_VERSION = 10
+CURRENT_SCHEMA_VERSION = 11
 ACTIVE_STATUSES = tuple(
     status.value
     for status in (
@@ -96,6 +96,7 @@ class Database:
             8: self._migration_v8,
             9: self._migration_v9,
             10: self._migration_v10,
+            11: self._migration_v11,
         }
         for version in range(current + 1, CURRENT_SCHEMA_VERSION + 1):
             await db.execute("BEGIN IMMEDIATE")
@@ -127,7 +128,7 @@ class Database:
                 canonical_url TEXT,
                 extractor TEXT NOT NULL,
                 title TEXT,
-                duration INTEGER,
+                duration REAL,
                 uploader TEXT,
                 thumbnail_url TEXT,
                 formats_json TEXT NOT NULL,
@@ -217,7 +218,7 @@ class Database:
         await self.connection.execute(
             """CREATE TABLE IF NOT EXISTS media_sessions (
                 session_id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,url TEXT NOT NULL,
-                canonical_url TEXT,extractor TEXT NOT NULL,title TEXT,duration INTEGER,
+                canonical_url TEXT,extractor TEXT NOT NULL,title TEXT,duration REAL,
                 uploader TEXT,thumbnail_url TEXT,formats_json TEXT NOT NULL,
                 created_at REAL NOT NULL,expires_at REAL NOT NULL
             )"""
@@ -435,6 +436,46 @@ class Database:
             )"""
         )
 
+    async def _migration_v11(self) -> None:
+        """Give source duration REAL affinity without discarding legacy rows."""
+        columns = await (
+            await self.connection.execute("PRAGMA table_info(media_sessions)")
+        ).fetchall()
+        duration = next((row for row in columns if row["name"] == "duration"), None)
+        if duration is None or str(duration["type"]).upper() == "REAL":
+            return
+        await self.connection.execute(
+            """CREATE TABLE media_sessions_v11 (
+                session_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                canonical_url TEXT,
+                extractor TEXT NOT NULL,
+                title TEXT,
+                duration REAL,
+                uploader TEXT,
+                thumbnail_url TEXT,
+                formats_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                extras_json TEXT NOT NULL DEFAULT '{}'
+            )"""
+        )
+        await self.connection.execute(
+            """INSERT INTO media_sessions_v11
+               (session_id,user_id,url,canonical_url,extractor,title,duration,uploader,
+                thumbnail_url,formats_json,created_at,expires_at,extras_json)
+               SELECT session_id,user_id,url,canonical_url,extractor,title,
+                      CAST(duration AS REAL),uploader,thumbnail_url,formats_json,
+                      created_at,expires_at,extras_json
+               FROM media_sessions"""
+        )
+        await self.connection.execute("DROP TABLE media_sessions")
+        await self.connection.execute("ALTER TABLE media_sessions_v11 RENAME TO media_sessions")
+        await self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_expires ON media_sessions(expires_at)"
+        )
+
     async def schema_version(self) -> int:
         row = await (
             await self.connection.execute(
@@ -588,6 +629,8 @@ class Database:
             "ytdlp_impersonated": session.ytdlp_impersonated,
             "cookie_profile": session.cookie_profile,
             "source_media_id": session.media_id,
+            "thumbnail_url": session.thumbnail_url,
+            "source_duration": session.duration,
         }
         job = DownloadJob(
             media_session_id=session.session_id,
@@ -609,6 +652,8 @@ class Database:
             ytdlp_impersonated=session.ytdlp_impersonated,
             cookie_profile=session.cookie_profile,
             source_media_id=session.media_id,
+            thumbnail_url=session.thumbnail_url,
+            source_duration=session.duration,
         )
         # A separate connection isolates this short transaction from concurrent
         # progress/reservation writes on the application's main connection.
@@ -690,6 +735,8 @@ class Database:
             "ytdlp_impersonated": job.ytdlp_impersonated,
             "cookie_profile": job.cookie_profile,
             "source_media_id": job.source_media_id,
+            "thumbnail_url": job.thumbnail_url,
+            "source_duration": job.source_duration,
         }
         return (
             job.job_id,
@@ -739,6 +786,8 @@ class Database:
             "ytdlp_impersonated": job.ytdlp_impersonated,
             "cookie_profile": job.cookie_profile,
             "source_media_id": job.source_media_id,
+            "thumbnail_url": job.thumbnail_url,
+            "source_duration": job.source_duration,
         }
         await self.connection.execute(
             """UPDATE download_jobs SET message_id=?,status=?,progress_pct=?,
@@ -1652,6 +1701,8 @@ class Database:
         data["extractor"] = data.get("extractor") or snapshot.get("extractor")
         data["cookie_profile"] = snapshot.get("cookie_profile")
         data["source_media_id"] = snapshot.get("source_media_id")
+        data["thumbnail_url"] = snapshot.get("thumbnail_url")
+        data["source_duration"] = snapshot.get("source_duration")
         return DownloadJob.model_validate(data)
 
     async def maintain(self, *, job_days: int, cache_days: int) -> dict[str, int]:
