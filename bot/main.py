@@ -18,6 +18,7 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
 from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 
+from bot.batch_manager import global_batch_manager
 from bot.callbacks import router as callbacks_router
 from bot.callbacks.phase2 import router as phase2_callbacks_router
 from bot.callbacks.operations import router as operations_router
@@ -389,6 +390,7 @@ class BotApplication:
         self._shutdown = True
         if self.scheduler:
             self.scheduler.pause_new_jobs()
+        await global_batch_manager.shutdown()
         for task in (self._cleanup_task, self._maintenance_task):
             if task:
                 task.cancel()

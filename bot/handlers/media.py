@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from aiogram import Router, F
 from aiogram.types import Message
 
+from bot.batch_manager import BatchAnalysisManager, global_batch_manager
 from core.exceptions import BotError, ExtractionError, SecurityError
 from core.models import MediaItem, MediaSession
 from extractors.registry import ExtractorRegistry
@@ -70,13 +71,22 @@ def _platform_label(url: str) -> str:
 async def _analyze_batch(
     *, session: MediaSession, message: Message, status_msg, db: Database,
     governor: ResourceGovernor, extractor_registry: ExtractorRegistry,
+    batch_manager: BatchAnalysisManager,
 ) -> None:
     update_lock = asyncio.Lock()
 
     async def publish() -> None:
         async with update_lock:
+            if batch_manager.is_cancelled(session.session_id):
+                return
             await db.save_media_session(session)
             try:
+                view_draft = await db.get_ui_draft(
+                    session.user_id, f"batch-view:{session.session_id}"
+                )
+                current_view = (view_draft or {}).get("view", "status")
+                if current_view != "status":
+                    return
                 await status_msg.edit_text(
                     build_collection_text(session),
                     reply_markup=build_collection_keyboard(session),
@@ -85,7 +95,7 @@ async def _analyze_batch(
                 logger.debug("Batch status edit was rejected or unchanged", exc_info=True)
 
     async def analyze(item: MediaItem) -> None:
-        item.analysis_status = "analyzing"
+        item.analysis_status = "waiting"
         await publish()
         try:
             lease = await _wait_for_extraction_lease(
@@ -94,8 +104,13 @@ async def _analyze_batch(
             if lease is None:
                 item.analysis_status = "failed"
                 item.analysis_error_category = "access_revoked"
+                await publish()
                 return
+            item.analysis_status = "analyzing"
+            await publish()
             async with lease:
+                if batch_manager.is_cancelled(session.session_id):
+                    return
                 extractor = await extractor_registry.get_extractor_for_url(item.source_url)
                 child = await extractor.extract(
                     item.source_url,
@@ -108,15 +123,18 @@ async def _analyze_batch(
             item.extractor_id = child.media_id
             item.source_extractor = child.extractor
             item.analysis_status = "ready"
+            await publish()
         except BotError as error:
             item.analysis_status = "failed"
             item.analysis_error_category = getattr(error, "error_category", "media_unavailable")
+            await publish()
         except Exception:
             logger.exception("Batch child analysis failed")
             item.analysis_status = "failed"
             item.analysis_error_category = "unexpected_error"
-        finally:
             await publish()
+        finally:
+            pass
 
     await asyncio.gather(*(analyze(item) for item in session.items))
 
@@ -216,10 +234,12 @@ async def handle_potential_url(
         status_msg = await message.reply(
             build_collection_text(session), reply_markup=build_collection_keyboard(session)
         )
-        await _analyze_batch(
+        batch_manager = global_batch_manager
+        batch_manager.start(session.session_id, _analyze_batch(
             session=session, message=message, status_msg=status_msg, db=db,
             governor=governor, extractor_registry=extractor_registry,
-        )
+            batch_manager=batch_manager,
+        ))
         return
 
     url = urls[0]

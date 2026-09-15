@@ -6,6 +6,7 @@ from bot.callbacks.phase2 import (
     _filters, admin_actions, all_formats, performance_adjust,
     performance_advanced, performance_reset, prepare_download_all, queue_download_all,
 )
+from bot.batch_manager import global_batch_manager
 from bot.handlers.media import extract_urls_from_text, handle_potential_url
 from core.config import Settings
 from core.exceptions import ExtractionError
@@ -303,6 +304,7 @@ async def test_batch_child_failure_does_not_destroy_other_items(
             "SELECT session_id FROM media_sessions WHERE extractor='batch'"
         )
     ).fetchone()
+    await global_batch_manager.await_completion(row["session_id"])
     batch = await db.get_media_session(row["session_id"])
     assert len(batch.items) == 4
     assert [item.analysis_status for item in batch.items].count("ready") == 3

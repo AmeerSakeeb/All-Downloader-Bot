@@ -7,6 +7,7 @@ from typing import Any, cast
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
+from bot.batch_manager import global_batch_manager
 from core.config import Settings
 from core.models import JobStatus
 from extractors.format_manager import select_default_audio
@@ -167,10 +168,85 @@ async def callback_cancel_session(callback: CallbackQuery, db: Database) -> None
     session = await _owned_session(callback, db, parts[1])
     if not session:
         return
+    if session.session_kind == "batch":
+        draft = await db.get_ui_draft(
+            callback.from_user.id, f"cancel-confirm:{session.session_id}"
+        )
+        confirmed = draft.get("confirmed") if draft else False
+        if not confirmed:
+            await db.save_ui_draft(
+                callback.from_user.id, f"cancel-confirm:{session.session_id}",
+                {"confirmed": False},
+            )
+            await cast(Any, callback.message).edit_text(
+                "⏹ <b>Cancel this batch analysis?</b>\n\n"
+                "Active analysis stops. Ready items already queued are unaffected.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="✅ Cancel Batch",
+                        callback_data=f"cancel_batch_confirm:{session.session_id}",
+                    )],
+                    [InlineKeyboardButton(
+                        text="↩️ Keep",
+                        callback_data=f"cancel_keep:{session.session_id}",
+                    )],
+                ]),
+            )
+            await callback.answer()
+            return
+        await global_batch_manager.cancel(session.session_id)
+        await db.delete_media_session(session.session_id, callback.from_user.id)
+        await db.delete_ui_draft(callback.from_user.id, f"cancel-confirm:{session.session_id}")
+        await db.delete_ui_draft(callback.from_user.id, f"batch-view:{session.session_id}")
+        await db.delete_ui_draft(callback.from_user.id, f"items:{session.session_id}")
+        await cast(Any, callback.message).edit_text(
+            "⏹ <b>Batch cancelled</b>",
+        )
+        await callback.answer("Batch cancelled.")
+        return
     await db.delete_media_session(session.session_id, callback.from_user.id)
     if callback.message:
         await cast(Any, callback.message).edit_text("Selection cancelled.")
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cancel_batch_confirm:"))
+async def callback_cancel_batch_confirm(
+    callback: CallbackQuery, db: Database,
+) -> None:
+    session_id = (callback.data or "").split(":", 1)[-1]
+    session = await _owned_session(callback, db, session_id)
+    if not session:
+        return
+    await global_batch_manager.cancel(session.session_id)
+    await db.delete_media_session(session.session_id, callback.from_user.id)
+    await db.delete_ui_draft(callback.from_user.id, f"cancel-confirm:{session.session_id}")
+    await db.delete_ui_draft(callback.from_user.id, f"batch-view:{session.session_id}")
+    await db.delete_ui_draft(callback.from_user.id, f"items:{session.session_id}")
+    if callback.message:
+        await cast(Any, callback.message).edit_text("⏹ <b>Batch cancelled</b>")
+    await callback.answer("Batch cancelled.")
+
+
+@router.callback_query(F.data.startswith("cancel_keep:"))
+async def callback_cancel_keep(
+    callback: CallbackQuery, db: Database,
+) -> None:
+    session_id = (callback.data or "").split(":", 1)[-1]
+    session = await _owned_session(callback, db, session_id)
+    if not session:
+        return
+    await db.delete_ui_draft(callback.from_user.id, f"cancel-confirm:{session.session_id}")
+    await db.save_ui_draft(
+        callback.from_user.id, f"batch-view:{session.session_id}",
+        {"view": "status"},
+    )
+    if callback.message:
+        await cast(Any, callback.message).edit_text(
+            build_collection_text(session),
+            reply_markup=build_collection_keyboard(session),
+        )
+    await callback.answer("Keeping batch")
 
 
 @router.callback_query(F.data.startswith("cancel_job:"))

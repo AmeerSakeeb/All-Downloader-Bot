@@ -9,12 +9,14 @@ from typing import Any, cast
 
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from bot.batch_manager import global_batch_manager
 from core.config import ResourceMode, Settings
 from core.exceptions import BotError
 from core.models import (
     AudioCodec, DetailStyle, FavoriteFormatRule, MatchingStrategy, MediaFormat,
-    MediaSession, VideoCodec,
+    MediaItem, MediaSession, VideoCodec,
 )
 from extractors.format_manager import select_default_audio
 from extractors.registry import ExtractorRegistry
@@ -702,6 +704,28 @@ async def _extract_child_session(
         return child
 
 
+def _batch_ready_child(parent: MediaSession, item: MediaItem, user_id: int) -> MediaSession | None:
+    """Build a child MediaSession from a ready batch item's persisted data.
+
+    ONLY operates when item.analysis_status == "ready".
+    Constructs the child from persisted metadata/formats — never re-extracts.
+    """
+    if item.analysis_status != "ready":
+        return None
+    return MediaSession.with_ttl(
+        ttl_seconds=max(60, int(parent.expires_at - parent.created_at)),
+        user_id=user_id, url=item.source_url, canonical_url=item.source_url,
+        extractor=item.source_extractor or parent.extractor, title=item.title,
+        media_id=item.extractor_id, thumbnail_url=item.thumbnail_url,
+        formats=item.formats,
+        parent_collection_url=item.parent_collection_url or None,
+        collection_entry_index=item.collection_entry_index or None,
+        collection_entry_id=item.collection_entry_id or None,
+        ytdlp_impersonated=parent.ytdlp_impersonated,
+        cookie_profile=parent.cookie_profile,
+    )
+
+
 @router.callback_query(F.data.startswith("collection:"))
 async def collection(callback: CallbackQuery, db: Database) -> None:
     parts = (callback.data or "").split(":")
@@ -722,6 +746,7 @@ async def prepare_download_all(
     session = await _owned(callback, db, (callback.data or "").split(":", 1)[-1])
     if not session or not callback.message:
         return
+    batch_manager = global_batch_manager
     preferences = await db.get_user_settings(callback.from_user.id)
     rules = await db.ensure_default_favorite_rules(callback.from_user.id)
     choices: list[dict[str, Any]] = []
@@ -732,23 +757,14 @@ async def prepare_download_all(
     ]
     for index, item in enumerate(session.items, 1):
         if session.session_kind == "batch":
+            if batch_manager.is_cancelled(session.session_id):
+                lines.append(f"{index}. ⏹ Cancelled")
+                continue
             if item.analysis_status == "ready":
-                child = MediaSession.with_ttl(
-                    ttl_seconds=max(60, int(session.expires_at - session.created_at)),
-                    user_id=callback.from_user.id,
-                    url=item.source_url,
-                    canonical_url=item.source_url,
-                    extractor=item.source_extractor or session.extractor,
-                    title=item.title,
-                    media_id=item.extractor_id,
-                    thumbnail_url=item.thumbnail_url,
-                    formats=item.formats,
-                    parent_collection_url=item.parent_collection_url or None,
-                    collection_entry_index=item.collection_entry_index or None,
-                    collection_entry_id=item.collection_entry_id or None,
-                    ytdlp_impersonated=session.ytdlp_impersonated,
-                    cookie_profile=session.cookie_profile,
-                )
+                child = _batch_ready_child(session, item, callback.from_user.id)
+                if not child:
+                    lines.append(f"{index}. ❌ Analysis failed")
+                    continue
             elif item.analysis_status == "analyzing":
                 lines.append(f"{index}. 🔎 Still analyzing")
                 continue
@@ -933,6 +949,40 @@ async def collection_item(
     item = next((value for value in parent.items if value.item_id == parts[2]), None) if parent else None
     if not parent or not item:
         return
+    if parent.session_kind == "batch":
+        if item.analysis_status == "ready":
+            child = _batch_ready_child(parent, item, callback.from_user.id)
+            if not child:
+                await callback.answer(
+                    "This item is unavailable.", show_alert=True,
+                )
+                return
+            await db.save_media_session(child)
+            if item.kind == "image":
+                fmt = child.formats[0]
+                await cast(Any, callback.message).edit_text(
+                    f"🖼 <b>{escape(item.title)}</b>\n\nOriginal image source; no re-encoding.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                        text="⬇️ Download original", callback_data=f"assetfmt:{child.session_id}:{fmt.internal_key}"
+                    )], [InlineKeyboardButton(text="🔙 Back", callback_data=f"collection:{parent.session_id}")]]),
+                )
+            elif child.items:
+                await cast(Any, callback.message).edit_text(
+                    build_collection_text(child), reply_markup=build_collection_keyboard(child)
+                )
+            else:
+                text, markup = await _preferred(child, db)
+                await cast(Any, callback.message).edit_text(text, reply_markup=markup)
+            await callback.answer()
+            return
+        if item.analysis_status == "analyzing":
+            await callback.answer("This item is still being analyzed.", show_alert=True)
+            return
+        if item.analysis_status == "waiting":
+            await callback.answer("This item is waiting for analysis.", show_alert=True)
+            return
+        await callback.answer("Analysis failed for this item.", show_alert=True)
+        return
     child = await _child_session(parent, item, callback.from_user.id, extractor_registry, governor)
     if not child:
         await callback.answer(
@@ -960,22 +1010,106 @@ async def collection_item(
     await callback.answer()
 
 
+_STATUS_ICONS = {
+    "ready": "✅",
+    "analyzing": "🔎",
+    "waiting": "⏳",
+    "failed": "❌",
+}
+
+
+def _build_review_text(session: MediaSession) -> str:
+    lines = []
+    for index, item in enumerate(session.items, 1):
+        icon = _STATUS_ICONS.get(item.analysis_status, "⏳")
+        state = item.analysis_status.replace("_", " ").title()
+        lines.append(f"{icon} {index}. {escape(item.title)} ({state})")
+    return "\n".join(lines)
+
+
+def _build_review_keyboard(session: MediaSession, selected: set[str] | None = None) -> InlineKeyboardMarkup:
+    selected = selected or set()
+    builder = InlineKeyboardBuilder()
+    for item in session.items:
+        if item.analysis_status == "ready":
+            if item.item_id in selected:
+                builder.button(
+                    text=f"☑ {item.item_id[:6]}",
+                    callback_data=f"itoggle:{session.session_id}:{item.item_id}:0",
+                )
+            else:
+                builder.button(
+                    text=f"☐ {item.item_id[:6]}",
+                    callback_data=f"itoggle:{session.session_id}:{item.item_id}:0",
+                )
+        else:
+            builder.button(
+                text=f"🔒 {item.item_id[:6]}",
+                callback_data=f"noop",
+            )
+    builder.adjust(2)
+    builder.row(InlineKeyboardButton(text="▶️ Process Selected", callback_data=f"iprocess:{session.session_id}"))
+    builder.row(InlineKeyboardButton(text="🔄 Refresh", callback_data=f"iselect:{session.session_id}:refresh"))
+    builder.row(InlineKeyboardButton(text="↩️ Back to Batch", callback_data=f"iselect:{session.session_id}:back"))
+    return builder.as_markup()
+
+
 @router.callback_query(F.data.startswith("iselect:"))
 async def select_items(callback: CallbackQuery, db: Database) -> None:
     parts = (callback.data or "").split(":")
     session = await _owned(callback, db, parts[1]) if len(parts) in {2, 3} else None
-    if session:
-        page = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else 0
-        draft_key = f"items:{session.session_id}"
-        draft = await db.get_ui_draft(callback.from_user.id, draft_key)
-        if not draft or draft.get("kind") != "items" or draft.get("session_id") != session.session_id:
-            draft = {"kind": "items", "session_id": session.session_id, "selected": []}
-            await db.save_ui_draft(callback.from_user.id, draft_key, draft)
+    if not session:
+        return
+    special = parts[2] if len(parts) >= 3 else None
+    if special == "back":
+        await db.save_ui_draft(
+            callback.from_user.id, f"batch-view:{session.session_id}",
+            {"view": "status"},
+        )
         await cast(Any, callback.message).edit_text(
-            "☑ <b>Select media items</b>",
-            reply_markup=build_item_selection_keyboard(session, list(draft.get("selected") or []), page),
+            build_collection_text(session),
+            reply_markup=build_collection_keyboard(session),
         )
         await callback.answer()
+        return
+    if special == "refresh":
+        await db.save_ui_draft(
+            callback.from_user.id, f"batch-view:{session.session_id}",
+            {"view": "review"},
+        )
+        selection_draft = await db.get_ui_draft(
+            callback.from_user.id, f"items:{session.session_id}"
+        )
+        selected = set((selection_draft or {}).get("selected") or [])
+        await cast(Any, callback.message).edit_text(
+            "🔎 <b>Review Items</b>\n\n" + _build_review_text(session),
+            reply_markup=_build_review_keyboard(session, selected),
+        )
+        await callback.answer()
+        return
+    page = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() and special != "refresh" and special != "back" else 0
+    draft_key = f"items:{session.session_id}"
+    draft = await db.get_ui_draft(callback.from_user.id, draft_key)
+    if not draft or draft.get("kind") != "items" or draft.get("session_id") != session.session_id:
+        draft = {"kind": "items", "session_id": session.session_id, "selected": []}
+        await db.save_ui_draft(callback.from_user.id, draft_key, draft)
+    if session.session_kind == "batch":
+        await db.save_ui_draft(
+            callback.from_user.id, f"batch-view:{session.session_id}",
+            {"view": "review"},
+        )
+        selected = set(draft.get("selected") or [])
+        await cast(Any, callback.message).edit_text(
+            "🔎 <b>Review Items</b>\n\n" + _build_review_text(session),
+            reply_markup=_build_review_keyboard(session, selected),
+        )
+        await callback.answer()
+        return
+    await cast(Any, callback.message).edit_text(
+        "☑ <b>Select media items</b>",
+        reply_markup=build_item_selection_keyboard(session, list(draft.get("selected") or []), page),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("items:"))
@@ -1000,15 +1134,41 @@ async def select_first(callback: CallbackQuery, db: Database) -> None:
 async def item_toggle(callback: CallbackQuery, db: Database) -> None:
     parts = (callback.data or "").split(":")
     session = await _owned(callback, db, parts[1]) if len(parts) == 4 else None
+    if not session:
+        return
     draft_key = f"items:{parts[1]}"
     draft = await db.get_ui_draft(callback.from_user.id, draft_key)
-    if not session or not draft or draft.get("kind") != "items" or draft.get("session_id") != parts[1]:
+    if not draft or draft.get("kind") != "items" or draft.get("session_id") != parts[1]:
+        return
+    target = next((item for item in session.items if item.item_id == parts[2]), None)
+    if target is None:
+        await callback.answer("This item is no longer available.", show_alert=True)
+        return
+    if session.session_kind == "batch" and target.analysis_status != "ready":
+        if target.analysis_status == "analyzing":
+            text = "This item is still being analyzed."
+        elif target.analysis_status == "waiting":
+            text = "This item is waiting for analysis."
+        else:
+            text = "Analysis failed for this item."
+        await callback.answer(text, show_alert=True)
         return
     selected = list(draft.get("selected") or [])
     selected = [item for item in selected if item != parts[2]] if parts[2] in selected else selected + [parts[2]]
     draft["selected"] = selected
     await db.save_ui_draft(callback.from_user.id, draft_key, draft)
     page = int(parts[3]) if parts[3].isdigit() else 0
+    if session.session_kind == "batch":
+        await db.save_ui_draft(
+            callback.from_user.id, f"batch-view:{session.session_id}",
+            {"view": "review"},
+        )
+        await cast(Any, callback.message).edit_text(
+            "🔎 <b>Review Items</b>\n\n" + _build_review_text(session),
+            reply_markup=_build_review_keyboard(session, set(selected)),
+        )
+        await callback.answer()
+        return
     await cast(Any, callback.message).edit_reply_markup(
         reply_markup=build_item_selection_keyboard(session, selected, page)
     )
@@ -1031,11 +1191,36 @@ async def process_selected(
         "📚 <b>Preparing selected items</b>\n\nEach video keeps its own exact-format workflow."
     )
     for item in (item for item in session.items if item.item_id in selected):
-        child = await _child_session(session, item, callback.from_user.id, extractor_registry, governor)
-        if not child:
-            await cast(Any, callback.message).answer(f"⚠️ {escape(item.title[:150])}: this item could not be prepared.")
-            continue
-        await db.save_media_session(child)
+        if session.session_kind == "batch":
+            if item.analysis_status == "ready":
+                child = _batch_ready_child(session, item, callback.from_user.id)
+                if not child:
+                    await cast(Any, callback.message).answer(
+                        f"⚠️ {escape(item.title[:150])}: this item could not be prepared.",
+                    )
+                    continue
+                await db.save_media_session(child)
+            elif item.analysis_status == "analyzing":
+                await cast(Any, callback.message).answer(
+                    f"⏳ {escape(item.title[:150])}: still analyzing — skipped.",
+                )
+                continue
+            elif item.analysis_status == "waiting":
+                await cast(Any, callback.message).answer(
+                    f"⏳ {escape(item.title[:150])}: waiting for analysis — skipped.",
+                )
+                continue
+            else:
+                await cast(Any, callback.message).answer(
+                    f"❌ {escape(item.title[:150])}: analysis failed — skipped.",
+                )
+                continue
+        else:
+            child = await _child_session(session, item, callback.from_user.id, extractor_registry, governor)
+            if not child:
+                await cast(Any, callback.message).answer(f"⚠️ {escape(item.title[:150])}: this item could not be prepared.")
+                continue
+            await db.save_media_session(child)
         if item.kind == "image":
             markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
                 text="⬇️ Download original", callback_data=f"assetfmt:{child.session_id}:{child.formats[0].internal_key}"
